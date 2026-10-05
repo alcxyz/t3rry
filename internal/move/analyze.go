@@ -965,7 +965,12 @@ func planDuplicates(ctx context.Context, conn *sql.Conn, opts Options, plan *Pla
 // the chain is followed through rollouts whether or not the sessions in
 // between are imported.
 func planSubagentImports(ctx context.Context, conn *sql.Conn, opts Options, plan *Plan, codexOwned map[string]string, duplicates []string) error {
-	if len(codexOwned) == 0 || opts.CodexHome == "" || opts.KeepSubagentImports {
+	if len(codexOwned) == 0 || opts.CodexHome == "" {
+		return nil
+	}
+	if opts.KeepSubagentImports {
+		plan.Warnings = append(plan.Warnings,
+			"imported subagent sessions of moved threads were not checked and are kept because of --keep-subagent-imports")
 		return nil
 	}
 	var targets []string
@@ -1025,7 +1030,7 @@ func planSubagentImports(ctx context.Context, conn *sql.Conn, opts Options, plan
 		candidates = append(candidates, nativeID)
 	}
 	sort.Strings(candidates)
-	missing := 0
+	missing, broken := 0, 0
 	byProject := projectIndex(plan)
 	for _, nativeID := range candidates {
 		if !rollouts.has(nativeID) {
@@ -1039,6 +1044,12 @@ func planSubagentImports(ctx context.Context, conn *sql.Conn, opts Options, plan
 		for current := rollouts.parent(nativeID); current != "" && !visited[current]; current = rollouts.parent(current) {
 			if owner, owned := codexOwned[current]; owned {
 				projectID = owner
+				break
+			}
+			if !rollouts.has(current) {
+				// The chain continues through a session whose rollout is
+				// gone, so its root cannot be known.
+				broken++
 				break
 			}
 			visited[current] = true
@@ -1064,6 +1075,11 @@ func planSubagentImports(ctx context.Context, conn *sql.Conn, opts Options, plan
 	if missing > 0 {
 		plan.Warnings = append(plan.Warnings, fmt.Sprintf(
 			"%d imported Codex thread(s) in the target have no rollout under %s and were not checked", missing, opts.CodexHome))
+	}
+	if broken > 0 {
+		plan.Warnings = append(plan.Warnings, fmt.Sprintf(
+			"%d imported Codex subagent thread(s) in the target descend from a session without a rollout under %s and were not checked",
+			broken, opts.CodexHome))
 	}
 	if len(rollouts.problems) > 0 {
 		plan.Warnings = append(plan.Warnings, fmt.Sprintf(

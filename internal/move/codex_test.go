@@ -125,6 +125,27 @@ func TestKeepSubagentImports(t *testing.T) {
 	if got := f.dst.count("SELECT count(*) FROM orchestration_v2_projection_threads WHERE thread_id = ? AND deleted_at IS NULL", "import:codex:"+codexChild); got != 1 {
 		t.Fatalf("subagent import was deleted despite --keep-subagent-imports")
 	}
+	if !strings.Contains(strings.Join(plan.Warnings, "\n"), "kept because of --keep-subagent-imports") {
+		t.Fatalf("warnings: %v", plan.Warnings)
+	}
+}
+
+func TestChainThroughMissingRolloutWarns(t *testing.T) {
+	f := newFixture(t)
+	home := t.TempDir()
+	// The grandchild's parent has no rollout, so its root is unknown.
+	writeRollout(t, home, "sessions", codexGrandchild, spawnedBy(codexChild))
+	f.dst.thread(threadSpec{id: "import:codex:" + codexGrandchild, projectID: "p-dst", origin: "v1_import"})
+	f.dst.syncCursor()
+	opts := f.options()
+	opts.CodexHome = home
+	plan := analyzeOK(t, opts)
+	if plan.Projects[0].SubagentImports != 0 {
+		t.Fatalf("subagent imports = %d", plan.Projects[0].SubagentImports)
+	}
+	if !strings.Contains(strings.Join(plan.Warnings, "\n"), "1 imported Codex subagent thread(s) in the target descend from a session without a rollout") {
+		t.Fatalf("warnings: %v", plan.Warnings)
+	}
 }
 
 func TestRerunFinishesImportCleanup(t *testing.T) {
