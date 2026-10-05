@@ -90,6 +90,11 @@ func (r *Result) Write(w io.Writer) error {
 	if r.BackupDir != "" {
 		fmt.Fprintf(&b, "backup     %s\n", r.BackupDir)
 	}
+	if r.RolledBack {
+		fmt.Fprintln(&b, "target unchanged: the copy was rolled back and nothing was written to the source")
+		_, err := io.WriteString(w, b.String())
+		return err
+	}
 	tables := make([]string, 0, len(r.Rows))
 	for table, n := range r.Rows {
 		if n > 0 {

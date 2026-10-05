@@ -207,6 +207,7 @@ func (b *base) file(name, content string) {
 type fixture struct {
 	src, dst  *base
 	workspace string
+	other     string
 }
 
 // newFixture builds:
@@ -255,7 +256,7 @@ func newFixture(t *testing.T) *fixture {
 	dst.project("p-dst", link)
 	dst.thread(threadSpec{id: "import:codex:native-1", projectID: "p-dst", origin: "v1_import"})
 	dst.syncCursor()
-	return &fixture{src: src, dst: dst, workspace: workspace}
+	return &fixture{src: src, dst: dst, workspace: workspace, other: other}
 }
 
 func (f *fixture) options() Options {

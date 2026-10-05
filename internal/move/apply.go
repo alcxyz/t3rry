@@ -18,6 +18,8 @@ func applyTarget(ctx context.Context, conn *sql.Conn, plan *Plan, now time.Time,
 
 	// Events first, in source order, so AUTOINCREMENT assigns new sequences
 	// in the same order. Thread snapshots carry the target project id.
+	// Source-cleanup events stay behind: they mark the source database as the
+	// original's home, which a move back must be able to recognise.
 	events := schema.Table(tableEvents)
 	cols, exprs := selectList(events, "e", map[string]string{
 		"payload_json": "CASE WHEN e.event_type IN " + sqlList(threadSnapshotEventTypes) +
@@ -26,7 +28,9 @@ func applyTarget(ctx context.Context, conn *sql.Conn, plan *Plan, now time.Time,
 	}, "sequence")
 	n, err := exec(ctx, conn, "INSERT INTO main."+tableEvents+" ("+cols+") SELECT "+exprs+
 		" FROM src."+tableEvents+" e JOIN temp.t3rry_moved m ON m.thread_id = e.stream_id"+
-		" WHERE e.application_event_version = 2 AND e.aggregate_kind = 'thread' ORDER BY e.sequence")
+		" WHERE e.application_event_version = 2 AND e.aggregate_kind = 'thread'"+
+		" AND (e.command_id IS NULL OR e.command_id NOT LIKE '"+archiveCommandPrefix+"%')"+
+		" ORDER BY e.sequence")
 	if err != nil {
 		return fmt.Errorf("copy events: %w", err)
 	}

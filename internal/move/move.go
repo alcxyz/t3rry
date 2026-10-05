@@ -132,6 +132,8 @@ type Result struct {
 	AttachmentsCopied int
 	Archived          int
 	TasksDisabled     int
+	// RolledBack is set when the target copy failed and nothing was written.
+	RolledBack bool
 	// SourceError is set when the target commit succeeded but finishing the
 	// source failed.
 	SourceError  error
@@ -182,8 +184,12 @@ func Run(ctx context.Context, opts Options) (*Plan, *Result, error) {
 		if locked != nil {
 			plan = locked
 		}
+		if errors.Is(err, ErrBlocked) {
+			return plan, nil, err
+		}
 		if err != nil {
-			return plan, result, err
+			// Nothing reached the target; report only the backup taken.
+			return plan, &Result{BackupDir: result.BackupDir, RolledBack: true}, err
 		}
 	}
 
@@ -231,7 +237,7 @@ func moveTarget(ctx context.Context, opts Options, plan *Plan, now time.Time, re
 		return locked, ErrBlocked
 	}
 
-	commandID, err := newCommandID()
+	commandID, err := newCommandID(commandPrefix)
 	if err != nil {
 		return locked, err
 	}

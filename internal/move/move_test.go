@@ -447,7 +447,7 @@ func TestReverseMoveIsRefused(t *testing.T) {
 	if err := plan.Write(&out); err != nil {
 		t.Fatal(err)
 	}
-	want := "thread thread-a already exists in the target as an archived or deleted copy"
+	want := "thread thread-a was moved out of the target earlier and its original is archived there"
 	if !strings.Contains(out.String(), want) || !strings.Contains(out.String(), "unarchive it in the target's T3 Code") {
 		t.Fatalf("plan lacks %q:\n%s", want, out.String())
 	}
@@ -483,5 +483,224 @@ func TestBackupDirInsideAttachmentsIsRejected(t *testing.T) {
 	}
 	if got := f.dst.count("SELECT count(*) FROM orchestration_events"); got != before {
 		t.Fatal("rejected backup still wrote the target")
+	}
+}
+
+func TestSharedSessionAcrossProjectRuns(t *testing.T) {
+	f := newFixture(t)
+	f.dst.project("p-dst-other", f.other)
+	first := f.options()
+	first.Projects = []string{f.workspace}
+	first.BackupDir = filepath.Join(t.TempDir(), "backup")
+	if _, _, err := Run(context.Background(), first); err != nil {
+		t.Fatalf("first project: %v", err)
+	}
+
+	// The second project owns the shared session the first run inserted.
+	second := f.options()
+	second.Projects = []string{f.other}
+	second.BackupDir = filepath.Join(t.TempDir(), "backup")
+	plan, result, err := Run(context.Background(), second)
+	if err != nil {
+		var out bytes.Buffer
+		_ = plan.Write(&out)
+		t.Fatalf("second project: %v\n%s", err, out.String())
+	}
+	if got := result.Rows[tableSessions]; got != 0 {
+		t.Fatalf("second run inserted %d session rows, want 0", got)
+	}
+	if got := f.dst.count("SELECT count(*) FROM orchestration_v2_projection_provider_session_bindings WHERE provider_session_id LIKE '%:shared'"); got != 2 {
+		t.Fatalf("shared session has %d target bindings, want 2", got)
+	}
+	if got := f.dst.str("SELECT project_id FROM orchestration_v2_projection_threads WHERE thread_id = 'thread-x'"); got != "p-dst-other" {
+		t.Fatalf("thread-x project = %q", got)
+	}
+
+	// A live session with the same id is still a collision.
+	g := newFixture(t)
+	g.dst.project("p-dst-other", g.other)
+	g.src.exec("DELETE FROM orchestration_v2_projection_provider_session_bindings WHERE thread_id = 'thread-a' AND provider_session_id LIKE '%:shared'")
+	g.dst.exec(`INSERT INTO orchestration_v2_projection_provider_sessions (provider_session_id, provider, status, updated_at, payload_json, provider_instance_id)
+		VALUES ('provider-session:provider-instance:codex:shared', 'codex', 'ready', ?, '{}', 'codex')`, testStamp)
+	opts := g.options()
+	opts.Projects = []string{g.other}
+	if _, _, err := Run(context.Background(), opts); !errors.Is(err, ErrBlocked) {
+		t.Fatalf("live target session: err = %v, want ErrBlocked", err)
+	}
+}
+
+func TestReverseMoveOfArchivedThreadWithTask(t *testing.T) {
+	f := newFixture(t)
+	// thread-a is archived by the user before the move and keeps an enabled task.
+	f.src.exec(`UPDATE orchestration_v2_projection_threads SET archived_at = ?1,
+		payload_json = json_set(payload_json, '$.archivedAt', ?1) WHERE thread_id = 'thread-a'`, testStamp)
+	opts := f.options()
+	opts.BackupDir = filepath.Join(t.TempDir(), "backup")
+	if _, _, err := Run(context.Background(), opts); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.src.count(`SELECT count(*) FROM orchestration_events WHERE stream_id = 'thread-a'
+		AND event_type = 'thread.archived' AND command_id LIKE 'server:t3rry-archive:%'`); got != 1 {
+		t.Fatalf("source-archive markers on the already archived original = %d, want 1", got)
+	}
+	if got := f.src.str("SELECT archived_at FROM orchestration_v2_projection_threads WHERE thread_id = 'thread-a'"); got != testStamp {
+		t.Fatalf("marking changed archived_at to %q", got)
+	}
+	if got := f.dst.count("SELECT enabled FROM scheduled_tasks WHERE task_id = 'task-a'"); got != 1 {
+		t.Fatal("target task should stay enabled")
+	}
+
+	reverse := Options{From: f.dst.inst, To: f.src.inst, ArchiveSource: true, BackupDir: filepath.Join(t.TempDir(), "backup")}
+	plan, _, err := Run(context.Background(), reverse)
+	if !errors.Is(err, ErrBlocked) {
+		t.Fatalf("reverse move error = %v, want ErrBlocked", err)
+	}
+	var out bytes.Buffer
+	if err := plan.Write(&out); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "thread thread-a was moved out of the target earlier") {
+		t.Fatalf("plan:\n%s", out.String())
+	}
+	if got := f.dst.count("SELECT enabled FROM scheduled_tasks WHERE task_id = 'task-a'"); got != 1 {
+		t.Fatal("refused reverse move disabled the only enabled task")
+	}
+}
+
+func TestUserArchivedTargetCopyIsARetry(t *testing.T) {
+	f := newFixture(t)
+	opts := f.options()
+	opts.ArchiveSource = false
+	opts.BackupDir = filepath.Join(t.TempDir(), "backup")
+	f.src.exec("UPDATE scheduled_tasks SET enabled = 0")
+	if _, _, err := Run(context.Background(), opts); err != nil {
+		t.Fatal(err)
+	}
+	// The user archives the moved copy in the target, then finishes the
+	// source cleanup with a normal run.
+	f.dst.exec(`UPDATE orchestration_v2_projection_threads SET archived_at = ?1,
+		payload_json = json_set(payload_json, '$.archivedAt', ?1) WHERE thread_id = 'thread-a'`, testStamp)
+	opts.ArchiveSource = true
+	opts.BackupDir = filepath.Join(t.TempDir(), "backup")
+	plan, result, err := Run(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+	if plan.Blocked() || result.SourceError != nil || result.Archived != 2 {
+		t.Fatalf("retry: blocked=%v source error=%v archived=%d", plan.Blocked(), result.SourceError, result.Archived)
+	}
+}
+
+func TestBackupAttachmentsDestinationIsResolved(t *testing.T) {
+	f := newFixture(t)
+	before := f.dst.count("SELECT count(*) FROM orchestration_events")
+
+	// <backup>/attachments already exists as a link into the target's attachments.
+	linked := t.TempDir()
+	if err := os.Symlink(f.dst.inst.AttachmentsDir, filepath.Join(linked, "attachments")); err != nil {
+		t.Fatal(err)
+	}
+	// The backup dir links to the target's userdata, so its attachments are the target's.
+	userdataLink := filepath.Join(t.TempDir(), "userdata-link")
+	if err := os.Symlink(f.dst.inst.UserData, userdataLink); err != nil {
+		t.Fatal(err)
+	}
+	// A not yet existing backup dir below a link to the target's attachments.
+	attachmentsLink := filepath.Join(t.TempDir(), "attachments-link")
+	if err := os.Symlink(f.dst.inst.AttachmentsDir, attachmentsLink); err != nil {
+		t.Fatal(err)
+	}
+	for dir, want := range map[string]string{
+		linked:                                   "already exists",
+		userdataLink:                             "already exists",
+		filepath.Join(attachmentsLink, "nested"): "overlaps the target's attachments",
+	} {
+		opts := f.options()
+		opts.BackupDir = dir
+		_, _, err := Run(context.Background(), opts)
+		if err == nil || !strings.Contains(err.Error(), want) {
+			t.Fatalf("backup dir %s: err = %v, want %q", dir, err, want)
+		}
+	}
+	if got := f.dst.count("SELECT count(*) FROM orchestration_events"); got != before {
+		t.Fatal("rejected backup still wrote the target")
+	}
+
+	// The target's attachments tree lies inside <backup>/attachments.
+	g := newFixture(t)
+	outer := t.TempDir()
+	inner := filepath.Join(outer, "attachments", "store")
+	if err := os.MkdirAll(inner, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(g.dst.inst.AttachmentsDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(inner, g.dst.inst.AttachmentsDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := checkBackupDir(g.dst.inst.AttachmentsDir, outer); err == nil {
+		t.Fatal("backup whose attachments copy contains the target's attachments was accepted")
+	}
+}
+
+func TestSymlinkedAttachmentsRoot(t *testing.T) {
+	f := newFixture(t)
+	real := t.TempDir()
+	if err := os.WriteFile(filepath.Join(real, "existing-file.png"), []byte("old"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(f.dst.inst.AttachmentsDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(real, f.dst.inst.AttachmentsDir); err != nil {
+		t.Fatal(err)
+	}
+	opts := f.options()
+	opts.BackupDir = filepath.Join(t.TempDir(), "backup")
+	_, result, err := Run(context.Background(), opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if data, err := os.ReadFile(filepath.Join(opts.BackupDir, "attachments", "existing-file.png")); err != nil || string(data) != "old" {
+		t.Fatalf("backup of a symlinked attachments root: %q, %v", data, err)
+	}
+	if result.AttachmentsCopied != 1 {
+		t.Fatalf("attachments copied = %d, want 1", result.AttachmentsCopied)
+	}
+	if _, err := os.Lstat(filepath.Join(real, "thread-a-11111111-2222-4333-8444-555555555555.png")); err != nil {
+		t.Fatalf("moved attachment is not in the resolved attachments dir: %v", err)
+	}
+}
+
+func TestFailedTargetCopyReportsRollback(t *testing.T) {
+	f := newFixture(t)
+	f.dst.exec(`CREATE TRIGGER fail_copy BEFORE INSERT ON orchestration_v2_projection_messages
+		BEGIN SELECT RAISE(ABORT, 'injected failure'); END`)
+	before := f.dst.count("SELECT count(*) FROM orchestration_events")
+	opts := f.options()
+	opts.BackupDir = filepath.Join(t.TempDir(), "backup")
+	_, result, err := Run(context.Background(), opts)
+	if err == nil || !strings.Contains(err.Error(), "rolled back") {
+		t.Fatalf("err = %v, want a rolled back copy", err)
+	}
+	if result == nil || !result.RolledBack || len(result.Rows) != 0 || result.AttachmentsCopied != 0 {
+		t.Fatalf("result = %+v, want an empty rolled back result", result)
+	}
+	var out bytes.Buffer
+	if err := result.Write(&out); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(out.String(), "copied") || !strings.Contains(out.String(), "rolled back") {
+		t.Fatalf("report:\n%s", out.String())
+	}
+	if got := f.dst.count("SELECT count(*) FROM orchestration_events"); got != before {
+		t.Fatal("failed copy left target events")
+	}
+	if _, err := os.Stat(filepath.Join(f.dst.inst.AttachmentsDir, "thread-a-11111111-2222-4333-8444-555555555555.png")); !os.IsNotExist(err) {
+		t.Fatal("failed copy left an attachment")
+	}
+	if got := f.src.str("SELECT archived_at FROM orchestration_v2_projection_threads WHERE thread_id = 'thread-a'"); got != "" {
+		t.Fatal("failed copy archived the source")
 	}
 }

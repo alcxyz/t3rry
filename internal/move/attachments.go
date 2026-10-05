@@ -143,11 +143,13 @@ func listFiles(dir string) ([]string, error) {
 	return names, nil
 }
 
+// inspectAttachment plans one file copy between the resolved attachments
+// directories, so symlinked attachment roots are read and written in place.
 func inspectAttachment(opts Options, name string) (attachmentFile, bool, error) {
 	file := attachmentFile{
 		name: name,
-		src:  filepath.Join(opts.From.AttachmentsDir, name),
-		dst:  filepath.Join(opts.To.AttachmentsDir, name),
+		src:  filepath.Join(resolveExisting(opts.From.AttachmentsDir), name),
+		dst:  filepath.Join(resolveExisting(opts.To.AttachmentsDir), name),
 	}
 	info, err := os.Stat(file.src)
 	if err != nil {

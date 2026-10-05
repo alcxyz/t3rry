@@ -60,8 +60,8 @@ workspace root matches its physical path. See
 - **Repeatable.** Threads copied by an earlier run are recognised and
   skipped, and a rerun finishes any source cleanup that failed before. A
   thread that changed in the source since then blocks the move, and so does
-  moving a thread straight back onto its archived original: unarchive the
-  original in T3 Code instead.
+  moving a thread back onto the original t3rry archived when it moved it
+  away: unarchive the original in T3 Code instead.
 - **Backup location.** The backup directory may not lie inside the target's
   attachments directory, even through a symlink.
 
@@ -135,11 +135,33 @@ usage errors exit with status 2.
   cleanup may remove them; the plan warns about such threads.
 - Scheduled tasks bound to moved threads move with them and are disabled in
   the source. Project-level scheduled tasks stay in the source.
-- Command receipts, effect history, legacy (pre-v2) tables and checkpoint diff
-  caches are not copied. Threads whose legacy transcript was never opened in
-  the source are blocked until it is.
+- Threads whose legacy transcript was never opened in the source are blocked
+  until it is. See [What is not copied](#what-is-not-copied).
 - Only the target is backed up. Source changes are limited to archiving and
   can be undone by unarchiving.
+
+## What is not copied
+
+t3rry copies a thread's v2 events and its `orchestration_v2_projection_*`,
+`orchestration_v2_turn_item_positions` and session binding rows, plus
+scheduled tasks bound to it. It deliberately leaves these tables behind:
+
+| Table | Why it stays |
+| --- | --- |
+| `provider_session_runtime` | Only "import recent sessions" reads it; t3rry reads it to find duplicate imports. |
+| `orchestration_v2_events` | Unused at this schema; v2 events live in `orchestration_events`. |
+| `projection_threads`, `projection_thread_messages`, `projection_thread_activities`, `projection_thread_sessions`, `projection_turns`, `projection_pending_approvals`, `projection_thread_proposed_plans`, `projection_thread_pull_requests`, `projection_state` | Legacy v1 read models. The v2 server reads them only to import v1 threads it has not imported yet, and blocks such threads. Pull request links of v2 threads live in the thread itself. |
+| v1 thread events (`application_event_version = 1`) | Already converted into the thread's v2 events. |
+| `orchestration_v2_thread_launch_workflows` | Not read by the server at this schema. |
+| `orchestration_command_receipts`, `orchestration_v2_command_receipts` | Deduplicate retried client commands on the server that received them. |
+| `orchestration_v2_effect_outbox` | Server side effects; pending or running effects block the move, finished ones are history. |
+| `orchestration_v2_legacy_imports` | Tracks v1 imports in the source; a moved thread's imported history is already in its events. |
+| `checkpoint_diff_blobs` | A v1 checkpoint diff cache the server no longer reads at this schema. |
+| `auth_*`, `pull_request_files_viewed` | Per-server pairing, sessions and review state, not thread data. |
+
+Source-cleanup events (`thread.archived` and session detaches t3rry appends to
+the source) are not copied either. They mark the source as the home of the
+original, which lets t3rry refuse to move a thread back onto it.
 
 ## Installation
 

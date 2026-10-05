@@ -7,9 +7,17 @@ import (
 	"time"
 )
 
-// commandPrefix marks the command ids of events t3rry appends, so a later run
-// can tell its own source events from user activity.
+// commandPrefix marks the command ids of events t3rry appends to a target.
 const commandPrefix = "server:t3rry-move:"
+
+// archiveCommandPrefix marks the events t3rry's source cleanup appends: the
+// thread.archived event that records a thread as the original of a move, and
+// session detaches. These events are never copied, so a source-archive event
+// in a database means that database was the source of a move of the thread.
+const archiveCommandPrefix = "server:t3rry-archive:"
+
+// ownCommandPattern matches the command ids of every event t3rry writes.
+const ownCommandPattern = "server:t3rry-%"
 
 // threadSnapshotEventTypes are the v2 event types whose payload is the full
 // app thread, including projectId (OrchestrationV2DomainEvent upstream).
@@ -57,13 +65,13 @@ func newUUID() (string, error) {
 	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16]), nil
 }
 
-// newCommandID returns the command id for one t3rry write.
-func newCommandID() (string, error) {
+// newCommandID returns a command id for one t3rry write with the given prefix.
+func newCommandID(prefix string) (string, error) {
 	id, err := newUUID()
 	if err != nil {
 		return "", err
 	}
-	return commandPrefix + id, nil
+	return prefix + id, nil
 }
 
 // newEventID mirrors the server's IdAllocator event ids:

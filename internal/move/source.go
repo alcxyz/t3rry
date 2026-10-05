@@ -53,23 +53,38 @@ func finishSource(ctx context.Context, opts Options, plan *Plan, now time.Time, 
 		}
 	}()
 
-	commandID, err := newCommandID()
+	commandID, err := newCommandID(archiveCommandPrefix)
 	if err != nil {
 		return err
 	}
 	stamp := timestamp(now)
-	archived, detached := 0, 0
+	archived, marked, detached := 0, 0, 0
 	for _, id := range plan.selected {
-		var open bool
-		err := conn.QueryRowContext(ctx,
-			"SELECT archived_at IS NULL AND deleted_at IS NULL FROM main."+tableThreads+" WHERE thread_id = ?", id).Scan(&open)
+		var archivedAlready, deleted, hasMarker bool
+		err := conn.QueryRowContext(ctx, `
+			SELECT archived_at IS NOT NULL, deleted_at IS NOT NULL,
+				EXISTS (SELECT 1 FROM main.orchestration_events e
+					WHERE e.application_event_version = 2 AND e.aggregate_kind = 'thread' AND e.stream_id = ?1
+						AND e.event_type = 'thread.archived' AND e.command_id LIKE ?2)
+			FROM main.`+tableThreads+` WHERE thread_id = ?1`, id, archiveCommandPrefix+"%").
+			Scan(&archivedAlready, &deleted, &hasMarker)
 		if errors.Is(err, sql.ErrNoRows) {
 			continue
 		}
 		if err != nil {
 			return err
 		}
-		if open {
+		switch {
+		case deleted || hasMarker:
+		case archivedAlready:
+			// Archived by the user before the move: record the marker
+			// without changing when it was archived.
+			if err := appendThreadSnapshot(ctx, conn, id, "thread.archived", commandID, stamp,
+				"'$.titleRegeneration', NULL"); err != nil {
+				return fmt.Errorf("mark %s: %w", id, err)
+			}
+			marked++
+		default:
 			if err := appendThreadSnapshot(ctx, conn, id, "thread.archived", commandID, stamp,
 				"'$.archivedAt', ?2, '$.titleRegeneration', NULL, '$.updatedAt', ?2"); err != nil {
 				return fmt.Errorf("archive %s: %w", id, err)
@@ -93,7 +108,7 @@ func finishSource(ctx context.Context, opts Options, plan *Plan, now time.Time, 
 	if err != nil {
 		return fmt.Errorf("disable scheduled tasks: %w", err)
 	}
-	if archived == 0 && detached == 0 && tasks == 0 {
+	if archived == 0 && marked == 0 && detached == 0 && tasks == 0 {
 		return nil
 	}
 	if err := advanceCursor(ctx, conn, stamp); err != nil {
@@ -200,17 +215,20 @@ func backupTarget(ctx context.Context, to instance.Instance, dir string) error {
 	return copyTree(to.AttachmentsDir, filepath.Join(dir, "attachments"))
 }
 
-// checkBackupDir rejects backup directories whose attachments copy would land
-// inside, or on top of, the attachments directory being copied, following
-// symlinks in both paths.
+// checkBackupDir requires <dir>/attachments not to exist yet and rejects
+// destinations whose resolved attachments copy would land inside, or contain,
+// the target's attachments tree, following symlinks in both paths.
 func checkBackupDir(attachments, dir string) error {
-	attachmentsReal := resolveExisting(attachments)
-	dirReal := resolveExisting(dir)
-	if within(dirReal, attachmentsReal) {
-		return fmt.Errorf("backup directory %s is inside the target's attachments directory %s", dir, attachments)
+	dest := filepath.Join(dir, "attachments")
+	if _, err := os.Lstat(dest); err == nil {
+		return fmt.Errorf("backup destination %s already exists", dest)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
 	}
-	if within(attachmentsReal, filepath.Join(dirReal, "attachments")) {
-		return fmt.Errorf("backup directory %s would copy the target's attachments onto themselves", dir)
+	attachmentsReal := resolveExisting(attachments)
+	destReal := filepath.Join(resolveExisting(dir), "attachments")
+	if within(destReal, attachmentsReal) || within(attachmentsReal, destReal) {
+		return fmt.Errorf("backup directory %s overlaps the target's attachments directory %s", dir, attachments)
 	}
 	return nil
 }
@@ -247,15 +265,21 @@ func within(path, root string) bool {
 	return rel == "." || rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
+// copyTree copies the regular files below src, following a symlinked src
+// root, which WalkDir would otherwise not descend into.
 func copyTree(src, dst string) error {
-	if _, err := os.Stat(src); errors.Is(err, os.ErrNotExist) {
+	root, err := filepath.EvalSymlinks(src)
+	if errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
-	return filepath.WalkDir(src, func(path string, entry fs.DirEntry, err error) error {
+	if err != nil {
+		return err
+	}
+	return filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
-		rel, err := filepath.Rel(src, path)
+		rel, err := filepath.Rel(root, path)
 		if err != nil {
 			return err
 		}

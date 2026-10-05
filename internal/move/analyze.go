@@ -471,7 +471,7 @@ func fillMovedTable(ctx context.Context, conn *sql.Conn, plan *Plan, threads map
 // excludeAlreadyMoved drops threads an earlier run already copied, so a move
 // can be repeated. A thread that exists in the target for another reason, or
 // that changed in the source since it was copied, blocks the move.
-func excludeAlreadyMoved(ctx context.Context, conn *sql.Conn, opts Options, plan *Plan, threads map[string]*sourceThread) error {
+func excludeAlreadyMoved(ctx context.Context, conn *sql.Conn, _ Options, plan *Plan, threads map[string]*sourceThread) error {
 	present, err := queryStrings(ctx, conn, `
 		SELECT m.thread_id FROM temp.t3rry_moved m
 		WHERE EXISTS (SELECT 1 FROM main.orchestration_v2_projection_threads t WHERE t.thread_id = m.thread_id)
@@ -484,9 +484,10 @@ func excludeAlreadyMoved(ctx context.Context, conn *sql.Conn, opts Options, plan
 	byProject := projectIndex(plan)
 	var remaining []string
 	drop := map[string]bool{}
+	blocked := map[string]bool{}
 	for _, id := range present {
 		pp := byProject[threads[id].projectID]
-		var sameOrigin, diverged, targetClosed bool
+		var sameOrigin, diverged, original bool
 		err := conn.QueryRowContext(ctx, `
 			SELECT
 				EXISTS (SELECT 1 FROM src.orchestration_events s
@@ -497,34 +498,38 @@ func excludeAlreadyMoved(ctx context.Context, conn *sql.Conn, opts Options, plan
 					WHERE s.application_event_version = 2 AND s.aggregate_kind = 'thread' AND s.stream_id = ?1
 						AND (s.command_id IS NULL OR s.command_id NOT LIKE ?2)
 						AND NOT EXISTS (SELECT 1 FROM main.orchestration_events e WHERE e.event_id = s.event_id)),
-				COALESCE((SELECT archived_at IS NOT NULL OR deleted_at IS NOT NULL
-					FROM main.orchestration_v2_projection_threads WHERE thread_id = ?1), 0)`,
-			id, commandPrefix+"%").Scan(&sameOrigin, &diverged, &targetClosed)
+				EXISTS (SELECT 1 FROM main.orchestration_events e
+					WHERE e.application_event_version = 2 AND e.aggregate_kind = 'thread' AND e.stream_id = ?1
+						AND e.event_type = 'thread.archived' AND e.command_id LIKE ?3)`,
+			id, ownCommandPattern, archiveCommandPrefix+"%").Scan(&sameOrigin, &diverged, &original)
 		if err != nil {
 			return err
 		}
-		t := threads[id]
 		switch {
 		case !sameOrigin:
+			blocked[id] = true
 			pp.Blockers = append(pp.Blockers, fmt.Sprintf("thread %s already exists in the target", id))
+		case original:
+			// t3rry archived the target copy as the source of an earlier
+			// move: this run would move the thread back onto its original.
+			blocked[id] = true
+			pp.Blockers = append(pp.Blockers, fmt.Sprintf(
+				"thread %s was moved out of the target earlier and its original is archived there; "+
+					"unarchive it in the target's T3 Code and archive this copy instead of moving it back", id))
 		case diverged:
+			blocked[id] = true
 			pp.Blockers = append(pp.Blockers, fmt.Sprintf(
 				"thread %s was moved before but has changed in the source since", id))
-		case targetClosed && !t.archived && !t.deleted:
-			// The target copy is archived or deleted while the source copy is
-			// open: most likely the original of an earlier move in the other
-			// direction. Skipping it would leave the thread closed on both.
-			pp.Blockers = append(pp.Blockers, fmt.Sprintf(
-				"thread %s already exists in the target as an archived or deleted copy, probably the original of an earlier move; "+
-					"unarchive it in the target's T3 Code and archive this copy instead of moving it back", id))
 		default:
 			drop[id] = true
 			pp.AlreadyMoved++
 			pp.Threads--
 		}
 	}
+	// Present threads leave the working set: already moved ones need only
+	// source cleanup, and blocked ones already explain why.
 	for _, id := range plan.threads {
-		if drop[id] {
+		if drop[id] || blocked[id] {
 			if _, err := conn.ExecContext(ctx, "DELETE FROM temp.t3rry_moved WHERE thread_id = ?", id); err != nil {
 				return err
 			}
@@ -533,21 +538,18 @@ func excludeAlreadyMoved(ctx context.Context, conn *sql.Conn, opts Options, plan
 		}
 		// Every selected thread that is or will be in the target gets its
 		// source cleanup, so a retry after a failed cleanup finishes it.
-		plan.selected = append(plan.selected, id)
-		t := threads[id]
-		if opts.ArchiveSource && !t.deleted && !t.archived {
-			plan.archive = append(plan.archive, id)
-			byProject[t.projectID].Archive++
+		if !blocked[id] {
+			plan.selected = append(plan.selected, id)
 		}
 	}
 	plan.threads = remaining
-	sort.Strings(plan.archive)
 	return nil
 }
 
-// planSourceCleanup counts the scheduled tasks and live session bindings the
-// source still holds for selected threads, including threads an earlier run
-// already copied. Without archiving, enabled tasks would run on both servers.
+// planSourceCleanup counts the source cleanup still due for selected threads,
+// including threads an earlier run already copied: threads without a
+// source-archive marker, enabled scheduled tasks and live session bindings.
+// Without archiving, enabled tasks would run on both servers.
 func planSourceCleanup(ctx context.Context, conn *sql.Conn, opts Options, plan *Plan, threads map[string]*sourceThread) error {
 	if len(plan.selected) == 0 {
 		return nil
@@ -580,6 +582,37 @@ func planSourceCleanup(ctx context.Context, conn *sql.Conn, opts Options, plan *
 	if err := rows.Close(); err != nil {
 		return err
 	}
+
+	// Source cleanup marks every selected thread that is not deleted with a
+	// source-archive event, archiving it when it is still open. The marker
+	// lets a later move in the opposite direction recognise the original.
+	if opts.ArchiveSource {
+		rows, err := conn.QueryContext(ctx, `
+			SELECT t.thread_id, t.project_id FROM src.orchestration_v2_projection_threads t
+			WHERE t.thread_id IN (SELECT value FROM json_each(?1)) AND t.deleted_at IS NULL
+				AND NOT EXISTS (SELECT 1 FROM src.orchestration_events e
+					WHERE e.application_event_version = 2 AND e.aggregate_kind = 'thread'
+						AND e.stream_id = t.thread_id AND e.event_type = 'thread.archived' AND e.command_id LIKE ?2)
+			ORDER BY t.thread_id`, string(ids), archiveCommandPrefix+"%")
+		if err != nil {
+			return err
+		}
+		for rows.Next() {
+			var id, projectID string
+			if err := rows.Scan(&id, &projectID); err != nil {
+				_ = rows.Close()
+				return err
+			}
+			plan.archive = append(plan.archive, id)
+			if pp := byProject[projectID]; pp != nil {
+				pp.Archive++
+			}
+		}
+		if err := rows.Close(); err != nil {
+			return err
+		}
+	}
+
 	return conn.QueryRowContext(ctx, `
 		SELECT count(*) FROM src.orchestration_v2_projection_provider_session_bindings b
 		JOIN src.orchestration_v2_projection_provider_sessions s ON s.provider_session_id = b.provider_session_id
@@ -694,6 +727,7 @@ func checkCollisions(ctx context.Context, conn *sql.Conn, _ Options, plan *Plan,
 		SELECT count(*) FROM src.orchestration_events s
 		JOIN temp.t3rry_moved m ON m.thread_id = s.stream_id
 		WHERE s.application_event_version = 2 AND s.aggregate_kind = 'thread'
+			AND (s.command_id IS NULL OR s.command_id NOT LIKE '`+archiveCommandPrefix+`%')
 			AND EXISTS (SELECT 1 FROM main.orchestration_events e WHERE e.event_id = s.event_id)`).Scan(&count)
 	if err != nil {
 		return err
@@ -730,6 +764,7 @@ func countRows(ctx context.Context, conn *sql.Conn, _ Options, plan *Plan, _ map
 		SELECT m.source_project_id, count(*) FROM src.orchestration_events e
 		JOIN temp.t3rry_moved m ON m.thread_id = e.stream_id
 		WHERE e.application_event_version = 2 AND e.aggregate_kind = 'thread'
+			AND (e.command_id IS NULL OR e.command_id NOT LIKE '`+archiveCommandPrefix+`%')
 		GROUP BY m.source_project_id`)
 	if err != nil {
 		return err
@@ -769,6 +804,9 @@ func planSessions(ctx context.Context, conn *sql.Conn, _ Options, plan *Plan, _ 
 				OR (s.thread_id IS NOT NULL AND s.thread_id NOT IN `+movedThreads+`),
 			EXISTS (SELECT 1 FROM main.orchestration_v2_projection_provider_sessions t
 				WHERE t.provider_session_id = s.provider_session_id),
+			EXISTS (SELECT 1 FROM main.orchestration_v2_projection_provider_sessions t
+				WHERE t.provider_session_id = s.provider_session_id AND t.status = 'stopped'
+					AND t.provider = s.provider AND t.provider_instance_id IS s.provider_instance_id),
 			COALESCE((SELECT MIN(b.thread_id) FROM src.orchestration_v2_projection_provider_session_bindings b
 				WHERE b.provider_session_id = s.provider_session_id AND b.thread_id IN `+movedThreads+`), s.thread_id)
 		FROM src.orchestration_v2_projection_provider_sessions s
@@ -783,10 +821,13 @@ func planSessions(ctx context.Context, conn *sql.Conn, _ Options, plan *Plan, _ 
 	collisions := 0
 	for rows.Next() {
 		var s sessionCopy
-		if err := rows.Scan(&s.id, &s.shared, &s.inTarget, &s.boundThread); err != nil {
+		var stoppedCopy bool
+		if err := rows.Scan(&s.id, &s.shared, &s.inTarget, &stoppedCopy, &s.boundThread); err != nil {
 			return err
 		}
-		if !s.shared && s.inTarget {
+		// A stopped copy of the same session is what an earlier move of a
+		// thread sharing it inserted; only the bindings are missing.
+		if !s.shared && s.inTarget && !stoppedCopy {
 			collisions++
 		}
 		plan.sessions = append(plan.sessions, s)
