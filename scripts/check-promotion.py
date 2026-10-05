@@ -27,6 +27,17 @@ def check(event, current, base_version, tag_exists):
         raise ValueError("promotion version already has a tag; choose a new version")
 
 
+def version_at(commit):
+    """Return VERSION at commit; a base without one has never released."""
+    shown = subprocess.run(["git", "show", f"{commit}:VERSION"], text=True, capture_output=True)
+    if shown.returncode == 0:
+        return shown.stdout.strip()
+    exists = subprocess.run(["git", "cat-file", "-e", f"{commit}^{{commit}}"]).returncode
+    if exists != 0:
+        raise ValueError("could not read the base commit")
+    return "0.0.0"
+
+
 def main():
     if os.environ.get("GITHUB_EVENT_NAME") != "pull_request":
         return
@@ -39,8 +50,7 @@ def main():
         raise ValueError("invalid base commit")
     current = Path("VERSION").read_text().strip()
     semver(current)
-    base_version = subprocess.check_output(
-        ["git", "show", f"{base}:VERSION"], text=True).strip()
+    base_version = version_at(base)
     status = subprocess.run(["git", "show-ref", "--verify", "--quiet",
                              f"refs/tags/v{current}"]).returncode
     if status not in (0, 1):

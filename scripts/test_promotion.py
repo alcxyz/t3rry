@@ -1,5 +1,6 @@
 import importlib.util
 from pathlib import Path
+import subprocess
 import unittest
 
 spec = importlib.util.spec_from_file_location("promotion", Path(__file__).with_name("check-promotion.py"))
@@ -30,6 +31,17 @@ class PromotionTests(unittest.TestCase):
 
     def test_development_prs_do_not_require_a_release(self):
         promotion.check(event(head="feature", base="dev"), "0.9.2-dev", "0.9.2", True)
+
+    def test_first_release_is_accepted(self):
+        promotion.check(event(), "0.1.0", "0.0.0", False)
+
+    def test_base_without_version_counts_as_unreleased(self):
+        first = subprocess.check_output(["git", "rev-list", "--max-parents=0", "HEAD"], text=True).split()[0]
+        if subprocess.run(["git", "cat-file", "-e", f"{first}:VERSION"]).returncode == 0:
+            self.skipTest("the root commit has a VERSION file")
+        self.assertEqual(promotion.version_at(first), "0.0.0")
+        head = subprocess.check_output(["git", "show", "HEAD:VERSION"], text=True).strip()
+        self.assertEqual(promotion.version_at("HEAD"), head)
 
     def test_versions_are_compared_numerically(self):
         promotion.check(event(), "0.10.0", "0.9.2", False)
