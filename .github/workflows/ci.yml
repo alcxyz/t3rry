@@ -1,0 +1,166 @@
+name: CI
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
+
+permissions:
+  contents: read
+
+jobs:
+  promotion:
+    name: Promotion policy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - run: python3 scripts/check-promotion.py
+
+  check:
+    name: Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Check go.mod tidy
+        run: |
+          go mod tidy
+          git diff --exit-code go.mod go.sum || (echo "FAIL: go.mod/go.sum not tidy" && exit 1)
+
+      - name: Check gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "FAIL: files not formatted:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Check generated schemas
+        run: |
+          go generate ./internal/store
+          git diff --exit-code internal/store || (echo "FAIL: run go generate ./internal/store" && exit 1)
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Lint
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.11
+
+      - name: Test
+        run: go test -race ./...
+
+      - name: Test promotion policy
+        run: python3 -m unittest discover -s scripts -p 'test_*.py'
+
+  release:
+    name: Release
+    needs: [promotion, check]
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Validate release version
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          VERSION="$(cat VERSION)"
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::main releases require VERSION to be plain semver, got $VERSION"
+            exit 1
+          fi
+
+      - name: GoReleaser snapshot
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          version: "~> v2"
+          args: release --snapshot --clean
+
+      - name: Validate release archives
+        run: |
+          set -euo pipefail
+          for tarball in dist/*.tar.gz; do
+            echo "==> Checking $tarball"
+
+            contents=$(tar tzf "$tarball")
+
+            # No '.' directory entry
+            if echo "$contents" | grep -qx '\./$\|^\.'; then
+              echo "FAIL: $tarball contains a '.' directory entry"
+              echo "$contents" | head -20
+              exit 1
+            fi
+
+            # Expected files present
+            for f in t3rry README.md LICENSE; do
+              if ! echo "$contents" | grep -qx "$f"; then
+                echo "FAIL: $tarball missing $f"
+                echo "$contents"
+                exit 1
+              fi
+            done
+
+            echo "  OK"
+          done
+
+      - name: Auto-tag release
+        id: tag
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          VERSION="v$(cat VERSION)"
+          if git tag -l "$VERSION" | grep -q . || git ls-remote --tags origin "$VERSION" | grep -q .; then
+            echo "Tag $VERSION already exists, skipping."
+            echo "created=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Creating tag $VERSION"
+            git tag "$VERSION"
+            git push origin "$VERSION"
+            echo "created=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run GoReleaser
+        if: steps.tag.outputs.created == 'true'
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          version: "~> v2"
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  nix:
+    name: Nix
+    needs: release
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - uses: DeterminateSystems/nix-installer-action@main
+
+      - name: Verify Nix package
+        run: nix build .#t3rry
