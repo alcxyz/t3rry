@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -543,6 +544,31 @@ func excludeAlreadyMoved(ctx context.Context, conn *sql.Conn, _ Options, plan *P
 		}
 	}
 	plan.threads = remaining
+	return fillSelectedTable(ctx, conn, plan, threads)
+}
+
+// fillSelectedTable records every selected thread, including those an
+// earlier run already copied, so the target cleanup of their imports also
+// finishes on a rerun.
+func fillSelectedTable(ctx context.Context, conn *sql.Conn, plan *Plan, threads map[string]*sourceThread) error {
+	if _, err := conn.ExecContext(ctx, "DROP TABLE IF EXISTS temp.t3rry_selected"); err != nil {
+		return err
+	}
+	if _, err := conn.ExecContext(ctx, `CREATE TEMP TABLE t3rry_selected (
+		thread_id TEXT PRIMARY KEY,
+		source_project_id TEXT NOT NULL)`); err != nil {
+		return err
+	}
+	stmt, err := conn.PrepareContext(ctx, "INSERT INTO temp.t3rry_selected VALUES (?, ?)")
+	if err != nil {
+		return err
+	}
+	defer func() { _ = stmt.Close() }()
+	for _, id := range plan.selected {
+		if _, err := stmt.ExecContext(ctx, id, threads[id].projectID); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -849,52 +875,76 @@ func planSessions(ctx context.Context, conn *sql.Conn, _ Options, plan *Plan, _ 
 }
 
 // planDuplicates finds target threads that "import recent sessions" created
-// for the provider sessions of moved threads.
+// for the provider sessions of selected threads and, per ADR-002, for the
+// Codex subagent sessions those sessions spawned.
 func planDuplicates(ctx context.Context, conn *sql.Conn, opts Options, plan *Plan, _ map[string]*sourceThread) error {
 	rows, err := conn.QueryContext(ctx, `
-		WITH candidates(thread_id, source_project_id) AS (
-			SELECT 'import:' || p.provider_instance_id || ':' || json_extract(p.payload_json, '$.nativeThreadRef.nativeId'),
-				m.source_project_id
-			FROM src.orchestration_v2_projection_provider_threads p
-			LEFT JOIN src.orchestration_v2_projection_nodes n ON n.node_id = p.owner_node_id
-			JOIN temp.t3rry_moved m ON m.thread_id = COALESCE(p.thread_id, n.thread_id)
-			WHERE p.provider_instance_id IS NOT NULL AND json_valid(p.payload_json)
-				AND json_extract(p.payload_json, '$.nativeThreadRef.nativeId') IS NOT NULL
-			UNION
-			SELECT 'import:' || COALESCE(r.provider_instance_id, r.provider_name) || ':' ||
-					CASE WHEN r.provider_name = 'codex'
-						THEN json_extract(r.resume_cursor_json, '$.threadId')
-						ELSE json_extract(r.resume_cursor_json, '$.resume') END,
-				m.source_project_id
-			FROM src.provider_session_runtime r
-			JOIN temp.t3rry_moved m ON m.thread_id = r.thread_id
-			WHERE json_valid(r.resume_cursor_json)
-		)
-		SELECT t.thread_id, MIN(c.source_project_id),
-			COALESCE(json_extract(t.payload_json, '$.historyOrigin'), ''),
-			(SELECT count(*) FROM main.orchestration_v2_projection_runs r WHERE r.thread_id = t.thread_id),
-			(SELECT count(*) FROM main.orchestration_v2_projection_provider_session_bindings b
-				JOIN main.orchestration_v2_projection_provider_sessions s ON s.provider_session_id = b.provider_session_id
-				WHERE b.thread_id = t.thread_id AND s.status NOT IN ('stopped', 'error'))
-		FROM main.orchestration_v2_projection_threads t
-		JOIN candidates c ON c.thread_id = t.thread_id
-		WHERE t.deleted_at IS NULL AND t.thread_id NOT IN `+movedThreads+`
-		GROUP BY t.thread_id
-		ORDER BY t.thread_id`)
+		SELECT p.provider_instance_id, json_extract(p.payload_json, '$.nativeThreadRef.driver'),
+			json_extract(p.payload_json, '$.nativeThreadRef.nativeId'), m.source_project_id
+		FROM src.orchestration_v2_projection_provider_threads p
+		LEFT JOIN src.orchestration_v2_projection_nodes n ON n.node_id = p.owner_node_id
+		JOIN temp.t3rry_selected m ON m.thread_id = COALESCE(p.thread_id, n.thread_id)
+		WHERE p.provider_instance_id IS NOT NULL AND json_valid(p.payload_json)
+			AND json_extract(p.payload_json, '$.nativeThreadRef.nativeId') IS NOT NULL
+		UNION
+		SELECT COALESCE(r.provider_instance_id, r.provider_name), r.provider_name,
+			CASE WHEN r.provider_name = 'codex'
+				THEN json_extract(r.resume_cursor_json, '$.threadId')
+				ELSE json_extract(r.resume_cursor_json, '$.resume') END,
+			m.source_project_id
+		FROM src.provider_session_runtime r
+		JOIN temp.t3rry_selected m ON m.thread_id = r.thread_id
+		WHERE json_valid(r.resume_cursor_json)
+		ORDER BY 1, 3, 4`)
 	if err != nil {
 		return err
 	}
-	defer func() { _ = rows.Close() }()
-	byProject := projectIndex(plan)
+	// sessionProject maps the import id of every session a selected thread
+	// owns to the thread's source project; codexOwned does the same for the
+	// Codex session ids alone.
+	sessionProject := map[string]string{}
+	codexOwned := map[string]string{}
 	for rows.Next() {
-		var id, projectID, origin string
-		var runs, liveSessions int
-		if err := rows.Scan(&id, &projectID, &origin, &runs, &liveSessions); err != nil {
+		var instanceID, driver, nativeID sql.NullString
+		var projectID string
+		if err := rows.Scan(&instanceID, &driver, &nativeID, &projectID); err != nil {
+			_ = rows.Close()
 			return err
 		}
-		pp := byProject[projectID]
+		if !instanceID.Valid || !nativeID.Valid || nativeID.String == "" {
+			continue
+		}
+		id := "import:" + instanceID.String + ":" + nativeID.String
+		if _, ok := sessionProject[id]; !ok {
+			sessionProject[id] = projectID
+		}
+		if driver.String == "codex" {
+			if _, ok := codexOwned[nativeID.String]; !ok {
+				codexOwned[nativeID.String] = projectID
+			}
+		}
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+
+	byProject := projectIndex(plan)
+	duplicates, err := queryStrings(ctx, conn, `
+		SELECT t.thread_id FROM main.orchestration_v2_projection_threads t
+		WHERE t.deleted_at IS NULL AND t.thread_id IN (SELECT value FROM json_each(?1))
+			AND t.thread_id NOT IN (SELECT thread_id FROM temp.t3rry_selected)
+		ORDER BY t.thread_id`, jsonKeys(sessionProject))
+	if err != nil {
+		return err
+	}
+	for _, id := range duplicates {
+		pp := byProject[sessionProject[id]]
+		keep, err := importHasActivity(ctx, conn, id)
+		if err != nil {
+			return err
+		}
 		switch {
-		case origin != "v1_import" || runs > 0 || liveSessions > 0:
+		case keep:
 			pp.Warnings = append(pp.Warnings, fmt.Sprintf(
 				"target thread %s duplicates a moved provider session but has its own activity; it is kept", id))
 		case opts.KeepDuplicates:
@@ -905,7 +955,154 @@ func planDuplicates(ctx context.Context, conn *sql.Conn, opts Options, plan *Pla
 			pp.Duplicates++
 		}
 	}
-	return rows.Err()
+	return planSubagentImports(ctx, conn, opts, plan, codexOwned, duplicates)
+}
+
+// planSubagentImports finds target imports of Codex sessions that a moved
+// session spawned as a subagent, directly or through other subagents. Codex
+// records the parent only in the session_meta line of the child's rollout.
+func planSubagentImports(ctx context.Context, conn *sql.Conn, opts Options, plan *Plan, codexOwned map[string]string, duplicates []string) error {
+	if len(codexOwned) == 0 || opts.CodexHome == "" {
+		return nil
+	}
+	var targets []string
+	for _, pp := range plan.Projects {
+		if pp.TargetID != "" {
+			targets = append(targets, pp.TargetID)
+		}
+	}
+	targetJSON, err := json.Marshal(targets)
+	if err != nil {
+		return err
+	}
+	rows, err := conn.QueryContext(ctx, `
+		SELECT t.thread_id, COALESCE(t.provider_instance_id, '') FROM main.orchestration_v2_projection_threads t
+		WHERE t.deleted_at IS NULL AND t.default_provider = 'codex' AND t.thread_id LIKE 'import:%'
+			AND t.project_id IN (SELECT value FROM json_each(?1))
+			AND t.thread_id NOT IN (SELECT thread_id FROM temp.t3rry_selected)
+		ORDER BY t.thread_id`, string(targetJSON))
+	if err != nil {
+		return err
+	}
+	skip := map[string]bool{}
+	for _, id := range duplicates {
+		skip[id] = true
+	}
+	// threadOf maps a candidate's Codex session id to its target thread.
+	threadOf := map[string]string{}
+	for rows.Next() {
+		var id, instanceID string
+		if err := rows.Scan(&id, &instanceID); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		prefix := "import:" + instanceID + ":"
+		if skip[id] || instanceID == "" || !strings.HasPrefix(id, prefix) {
+			continue
+		}
+		threadOf[strings.TrimPrefix(id, prefix)] = id
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if len(threadOf) == 0 {
+		return nil
+	}
+	if _, err := os.Stat(opts.CodexHome); err != nil {
+		plan.Warnings = append(plan.Warnings, fmt.Sprintf(
+			"Codex home %s is not readable (%v); imported subagent sessions were not checked", opts.CodexHome, err))
+		return nil
+	}
+
+	ids := map[string]bool{}
+	for nativeID := range threadOf {
+		ids[nativeID] = true
+	}
+	parents, missing, err := codexParents(opts.CodexHome, ids)
+	if err != nil {
+		return err
+	}
+	if len(missing) > 0 {
+		plan.Warnings = append(plan.Warnings, fmt.Sprintf(
+			"%d imported Codex thread(s) in the target have no rollout under %s and were not checked", len(missing), opts.CodexHome))
+	}
+
+	// Resolve each candidate to the moved session at the root of its spawn
+	// chain, if any. Chains are short; the depth bound guards against cycles.
+	spawned := map[string]string{}
+	for nativeID := range threadOf {
+		current := nativeID
+		for depth := 0; depth <= len(parents); depth++ {
+			parent, ok := parents[current]
+			if !ok {
+				break
+			}
+			if projectID, owned := codexOwned[parent]; owned {
+				spawned[nativeID] = projectID
+				break
+			}
+			current = parent
+		}
+	}
+
+	byProject := projectIndex(plan)
+	found := make([]string, 0, len(spawned))
+	for nativeID := range spawned {
+		found = append(found, nativeID)
+	}
+	sort.Strings(found)
+	for _, nativeID := range found {
+		id := threadOf[nativeID]
+		pp := byProject[spawned[nativeID]]
+		keep, err := importHasActivity(ctx, conn, id)
+		if err != nil {
+			return err
+		}
+		switch {
+		case keep:
+			pp.Warnings = append(pp.Warnings, fmt.Sprintf(
+				"target thread %s imports a subagent session of a moved thread but has its own activity; it is kept", id))
+		case opts.KeepSubagentImports:
+			pp.Warnings = append(pp.Warnings, fmt.Sprintf(
+				"target thread %s imports a subagent session of a moved thread; kept because of --keep-subagent-imports", id))
+		default:
+			plan.subagentImports = append(plan.subagentImports, id)
+			pp.SubagentImports++
+		}
+	}
+	return nil
+}
+
+// importHasActivity reports whether a target thread is more than an untouched
+// import: it was not imported, has runs of its own, or holds a live session.
+func importHasActivity(ctx context.Context, conn *sql.Conn, id string) (bool, error) {
+	var origin string
+	var runs, liveSessions int
+	err := conn.QueryRowContext(ctx, `
+		SELECT COALESCE(json_extract(t.payload_json, '$.historyOrigin'), ''),
+			(SELECT count(*) FROM main.orchestration_v2_projection_runs r WHERE r.thread_id = t.thread_id),
+			(SELECT count(*) FROM main.orchestration_v2_projection_provider_session_bindings b
+				JOIN main.orchestration_v2_projection_provider_sessions s ON s.provider_session_id = b.provider_session_id
+				WHERE b.thread_id = t.thread_id AND s.status NOT IN ('stopped', 'error'))
+		FROM main.orchestration_v2_projection_threads t WHERE t.thread_id = ?`, id).Scan(&origin, &runs, &liveSessions)
+	if err != nil {
+		return false, err
+	}
+	return origin != "v1_import" || runs > 0 || liveSessions > 0, nil
+}
+
+// jsonKeys returns the keys of m as a JSON array for json_each.
+func jsonKeys(m map[string]string) string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	data, err := json.Marshal(keys)
+	if err != nil {
+		panic(err)
+	}
+	return string(data)
 }
 
 // planScheduledTasks moves scheduled tasks bound to moved threads and warns

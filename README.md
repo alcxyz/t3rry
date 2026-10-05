@@ -25,7 +25,7 @@ project, t3rry:
    rebuilding anything;
 4. copies referenced attachment files without overwriting anything;
 5. soft-deletes target threads that "import recent sessions" created for the
-   same provider sessions;
+   same provider sessions, and for the Codex subagent sessions they spawned;
 6. archives the moved threads in the source, so only one server drives each
    provider session.
 
@@ -34,6 +34,13 @@ live in the shared `~/.claude` and `~/.codex` directories, so neither needs
 copying on the same host. Projects are matched by real path, so a symlinked
 workspace root matches its physical path. See
 [ADR-001](docs/adr/ADR-001-offline-row-level-thread-moves.md) for the design.
+
+A move is complete by default: the target ends up with the moved threads and
+without imported copies of their sessions. Codex records which session spawned
+a subagent only in the first line of the subagent's rollout, so t3rry reads
+that line under the Codex home. It never writes provider data. Imports that
+have their own runs or a live session are always kept. See
+[ADR-002](docs/adr/ADR-002-complete-moves-remove-subagent-imports.md).
 
 ## Safety model
 
@@ -58,7 +65,9 @@ workspace root matches its physical path. See
   `VACUUM INTO`, and its attachments directory, to
   `<to>/userdata/t3rry-backups/<timestamp>/` (or `--backup-dir`).
 - **Repeatable.** Threads copied by an earlier run are recognised and
-  skipped, and a rerun finishes any source cleanup that failed before. A
+  skipped, and a rerun finishes any source cleanup that failed before. It
+  also soft-deletes imports of the moved sessions that the target gained
+  since, or that an older t3rry release left behind. A
   thread that changed in the source since then blocks the move, and so does
   moving a thread back onto the original t3rry archived when it moved it
   away: unarchive the original in T3 Code instead.
@@ -116,6 +125,8 @@ systemctl --user start t3code.service t3code-work.service
 | `--include-deleted` | plan, move | Also move deleted threads |
 | `--yes` | move | Perform the move |
 | `--keep-duplicates` | move | Keep target threads imported from the same sessions |
+| `--keep-subagent-imports` | move | Keep target threads imported from subagent sessions of moved threads |
+| `--codex-home <dir>` | plan, move | Codex home with session rollouts; default `$CODEX_HOME` or `~/.codex` |
 | `--no-archive-source` | move | Leave moved threads unarchived in the source |
 | `--backup-dir <dir>` | move | Where to write the target backup |
 | `--base-dir <dir>` | check | Base directory to check |

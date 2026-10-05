@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/alcxyz/t3rry/internal/buildinfo"
@@ -25,15 +26,19 @@ const usage = `t3rry moves T3 Code projects between server base directories.
 
 Usage:
   t3rry [plan] --from <base-dir> --to <base-dir> [--project <path>]... [--include-deleted]
+               [--codex-home <dir>]
   t3rry move   --from <base-dir> --to <base-dir> [--project <path>]... --yes
-               [--include-deleted] [--keep-duplicates] [--no-archive-source]
-               [--backup-dir <dir>]
+               [--include-deleted] [--codex-home <dir>] [--keep-duplicates]
+               [--keep-subagent-imports] [--no-archive-source] [--backup-dir <dir>]
   t3rry check  --base-dir <base-dir>
   t3rry version
 
 Both servers must be stopped. plan is read-only and is the default command.
 Without --project, every source project with a matching target project is
-selected; --project accepts a source or target workspace path.
+selected; --project accepts a source or target workspace path. A move also
+soft-deletes the target's imports of the moved sessions and of the Codex
+subagent sessions they spawned, read from --codex-home (default $CODEX_HOME
+or ~/.codex).
 `
 
 // exitError carries a process exit status.
@@ -117,11 +122,14 @@ func runPlan(ctx context.Context, args []string, stdout, stderr io.Writer, write
 	var projects stringList
 	fs.Var(&projects, "project", "workspace path of a project to move (repeatable)")
 	includeDeleted := fs.Bool("include-deleted", false, "also move deleted threads")
-	var yes, keepDuplicates, noArchive *bool
+	codexHome := fs.String("codex-home", "", "Codex home with session rollouts (default $CODEX_HOME or ~/.codex)")
+	var yes, keepDuplicates, keepSubagentImports, noArchive *bool
 	var backupDir *string
 	if write {
 		yes = fs.Bool("yes", false, "perform the move")
 		keepDuplicates = fs.Bool("keep-duplicates", false, "do not soft-delete target threads imported from the same sessions")
+		keepSubagentImports = fs.Bool("keep-subagent-imports", false,
+			"do not soft-delete target threads imported from subagent sessions of moved threads")
 		noArchive = fs.Bool("no-archive-source", false, "do not archive moved threads in the source")
 		backupDir = fs.String("backup-dir", "", "target backup directory (default <to>/userdata/t3rry-backups/<timestamp>)")
 	}
@@ -149,15 +157,21 @@ func runPlan(ctx context.Context, args []string, stdout, stderr io.Writer, write
 	if err != nil {
 		return fmt.Errorf("--to: %w", err)
 	}
+	home, err := resolveCodexHome(*codexHome)
+	if err != nil {
+		return fmt.Errorf("--codex-home: %w", err)
+	}
 	opts := move.Options{
 		From:           source,
 		To:             target,
 		Projects:       projects,
 		IncludeDeleted: *includeDeleted,
 		ArchiveSource:  true,
+		CodexHome:      home,
 	}
 	if write {
 		opts.KeepDuplicates = *keepDuplicates
+		opts.KeepSubagentImports = *keepSubagentImports
 		opts.ArchiveSource = !*noArchive
 		if *backupDir != "" {
 			dir, err := instance.ExpandHome(*backupDir)
@@ -247,6 +261,23 @@ func runCheck(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 		return errSilent
 	}
 	return nil
+}
+
+// resolveCodexHome returns the Codex home to read rollouts from: the flag,
+// else $CODEX_HOME, else ~/.codex.
+func resolveCodexHome(flagValue string) (string, error) {
+	home := flagValue
+	if home == "" {
+		home = os.Getenv("CODEX_HOME")
+	}
+	if home == "" {
+		home = "~/.codex"
+	}
+	expanded, err := instance.ExpandHome(home)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Abs(expanded)
 }
 
 func joinInts(values []int) string {
