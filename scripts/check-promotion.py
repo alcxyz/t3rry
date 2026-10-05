@@ -28,14 +28,17 @@ def check(event, current, base_version, tag_exists):
 
 
 def version_at(commit):
-    """Return VERSION at commit; a base without one has never released."""
-    shown = subprocess.run(["git", "show", f"{commit}:VERSION"], text=True, capture_output=True)
-    if shown.returncode == 0:
-        return shown.stdout.strip()
-    exists = subprocess.run(["git", "cat-file", "-e", f"{commit}^{{commit}}"]).returncode
-    if exists != 0:
+    """Return VERSION at commit; a base without the file has never released."""
+    if subprocess.run(["git", "cat-file", "-e", f"{commit}^{{commit}}"],
+                      capture_output=True).returncode != 0:
         raise ValueError("could not read the base commit")
-    return "0.0.0"
+    # ls-tree fails when the tree cannot be read and prints nothing when the
+    # path is absent, so only an absent VERSION counts as unreleased.
+    entry = subprocess.check_output(["git", "ls-tree", commit, "--", "VERSION"], text=True)
+    if not entry.strip():
+        return "0.0.0"
+    # Failing to read an existing VERSION surfaces git's error.
+    return subprocess.check_output(["git", "show", f"{commit}:VERSION"], text=True).strip()
 
 
 def main():

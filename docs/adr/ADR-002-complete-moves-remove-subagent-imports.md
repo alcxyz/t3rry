@@ -31,10 +31,12 @@ considered only threads copied in that run.
   spawned, directly or through other subagents. It applies the same rules as
   for duplicates: only untouched imports (no runs and no live session) are
   deleted, and anything else is kept with a warning.
-- t3rry reads only the first line of the candidate sessions' rollouts under
-  the Codex home (`--codex-home`, default `$CODEX_HOME` or `~/.codex`). It
-  never writes provider data. A missing Codex home or rollout is a warning,
-  not a blocker.
+- t3rry reads only the first line of rollouts under the Codex home
+  (`--codex-home`, default `$CODEX_HOME` or `~/.codex`): those of candidate
+  sessions and, following the chain, of their ancestors, whether or not those
+  are imported. It never writes provider data. A missing Codex home, a missing
+  rollout or an unreadable one is a warning that leaves the sessions concerned
+  unchecked, not a blocker. `--keep-subagent-imports` skips the reading.
 - Candidates are untouched Codex imports in the moved projects' target
   projects. Sessions not spawned by a moved session, such as standalone
   `codex exec` runs, are left alone.

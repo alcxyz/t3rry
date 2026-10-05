@@ -20,20 +20,37 @@ const maxSessionMetaLine = 64 << 20
 // file name: rollout-<timestamp>-<uuid>.jsonl.
 const codexSessionIDLen = 36
 
-// codexParents reads the session_meta line of the Codex rollouts of the given
-// session ids under home and returns the parent session of every one that a
-// thread spawned as a subagent. Sessions without a readable rollout are
-// returned in missing.
-func codexParents(home string, ids map[string]bool) (parents map[string]string, missing []string, err error) {
-	paths := map[string]string{}
+// codexRollouts indexes the Codex rollouts under a Codex home by session id
+// and reads their parents on demand. Problems reading a directory or file are
+// collected rather than returned, so one bad rollout only leaves the sessions
+// it concerns unchecked.
+type codexRollouts struct {
+	paths    map[string]string
+	parents  map[string]string
+	read     map[string]bool
+	problems []string
+}
+
+// indexCodexRollouts walks the sessions and archived_sessions directories of
+// home, following a symlink at either root.
+func indexCodexRollouts(home string) *codexRollouts {
+	r := &codexRollouts{paths: map[string]string{}, parents: map[string]string{}, read: map[string]bool{}}
 	for _, dir := range []string{"sessions", "archived_sessions"} {
-		root := filepath.Join(home, dir)
-		err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		root, err := filepath.EvalSymlinks(filepath.Join(home, dir))
+		if errors.Is(err, fs.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			r.problems = append(r.problems, err.Error())
+			continue
+		}
+		err = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 			if err != nil {
-				if errors.Is(err, fs.ErrNotExist) && path == root {
+				r.problems = append(r.problems, err.Error())
+				if d != nil && d.IsDir() && path != root {
 					return fs.SkipDir
 				}
-				return err
+				return nil
 			}
 			name := d.Name()
 			if d.IsDir() || !strings.HasPrefix(name, "rollout-") || !strings.HasSuffix(name, ".jsonl") {
@@ -44,34 +61,42 @@ func codexParents(home string, ids map[string]bool) (parents map[string]string, 
 				return nil
 			}
 			id := stem[len(stem)-codexSessionIDLen:]
-			if ids[id] {
-				if _, seen := paths[id]; !seen {
-					paths[id] = path
-				}
+			if _, seen := r.paths[id]; !seen {
+				r.paths[id] = path
 			}
 			return nil
 		})
 		if err != nil {
-			return nil, nil, fmt.Errorf("read Codex sessions: %w", err)
+			r.problems = append(r.problems, err.Error())
 		}
 	}
+	return r
+}
 
-	parents = map[string]string{}
-	for id := range ids {
-		path, ok := paths[id]
-		if !ok {
-			missing = append(missing, id)
-			continue
-		}
-		parent, err := readCodexParent(path, id)
-		if err != nil {
-			return nil, nil, err
-		}
-		if parent != "" {
-			parents[id] = parent
-		}
+// has reports whether a rollout exists for the session.
+func (r *codexRollouts) has(id string) bool {
+	_, ok := r.paths[id]
+	return ok
+}
+
+// parent returns the session that spawned id, or "" when id is a top-level
+// session, has no rollout, or its rollout cannot be read.
+func (r *codexRollouts) parent(id string) string {
+	if r.read[id] {
+		return r.parents[id]
 	}
-	return parents, missing, nil
+	r.read[id] = true
+	path, ok := r.paths[id]
+	if !ok {
+		return ""
+	}
+	parent, err := readCodexParent(path, id)
+	if err != nil {
+		r.problems = append(r.problems, err.Error())
+		return ""
+	}
+	r.parents[id] = parent
+	return parent
 }
 
 // readCodexParent returns the parent session recorded in a rollout's

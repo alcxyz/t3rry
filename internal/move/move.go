@@ -203,7 +203,8 @@ func Run(ctx context.Context, opts Options) (*Plan, *Result, error) {
 			plan = locked
 		}
 		if errors.Is(err, ErrBlocked) {
-			return plan, nil, err
+			// Blocked under the lock after the backup: nothing was written.
+			return plan, &Result{BackupDir: result.BackupDir, RolledBack: true}, err
 		}
 		if err != nil {
 			// Nothing reached the target; report only the backup taken.
