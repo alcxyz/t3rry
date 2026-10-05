@@ -11,7 +11,7 @@ import (
 )
 
 // applyTarget copies the planned rows into the target and soft-deletes
-// duplicate imports. It runs inside the caller's BEGIN IMMEDIATE transaction
+// imports of the moved sessions. It runs inside the caller's BEGIN IMMEDIATE transaction
 // on a connection with the source attached as src.
 func applyTarget(ctx context.Context, conn *sql.Conn, plan *Plan, now time.Time, commandID string, result *Result) error {
 	schema := plan.schema
@@ -84,14 +84,25 @@ func applyTarget(ctx context.Context, conn *sql.Conn, plan *Plan, now time.Time,
 
 	stamp := timestamp(now)
 	for _, id := range plan.duplicates {
-		err := appendThreadSnapshot(ctx, conn, id, "thread.deleted", commandID, stamp, false,
-			"'$.deletedAt', COALESCE(json_extract(payload_json, '$.deletedAt'), ?2), '$.titleRegeneration', NULL, '$.updatedAt', ?2", stamp)
-		if err != nil {
+		if err := softDeleteImport(ctx, conn, id, commandID, stamp); err != nil {
 			return fmt.Errorf("soft-delete duplicate %s: %w", id, err)
 		}
 		result.Duplicates++
 	}
+	for _, id := range plan.subagentImports {
+		if err := softDeleteImport(ctx, conn, id, commandID, stamp); err != nil {
+			return fmt.Errorf("soft-delete subagent import %s: %w", id, err)
+		}
+		result.SubagentImports++
+	}
 	return advanceCursor(ctx, conn, stamp)
+}
+
+// softDeleteImport soft-deletes a target import thread with a full snapshot
+// event, as T3 Code's own delete command does.
+func softDeleteImport(ctx context.Context, conn *sql.Conn, id, commandID, stamp string) error {
+	return appendThreadSnapshot(ctx, conn, id, "thread.deleted", commandID, stamp, false,
+		"'$.deletedAt', COALESCE(json_extract(payload_json, '$.deletedAt'), ?2), '$.titleRegeneration', NULL, '$.updatedAt', ?2", stamp)
 }
 
 // copySessions copies sessions owned by moved threads verbatim and adds shared

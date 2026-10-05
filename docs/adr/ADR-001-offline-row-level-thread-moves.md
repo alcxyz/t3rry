@@ -49,6 +49,7 @@ transcripts live in the shared `~/.claude` and `~/.codex` directories.
   session are soft-deleted with a `thread.deleted` event. Moved source threads
   are archived in the source, so neither server drives the same provider
   session.
+  ADR-002 extends this cleanup to imported subagent sessions and to reruns.
 
 ## Alternatives and consequences
 

@@ -31,6 +31,12 @@ type Options struct {
 	// KeepDuplicates leaves target threads imported from the same provider
 	// sessions untouched.
 	KeepDuplicates bool
+	// KeepSubagentImports leaves target threads imported from subagent
+	// sessions that moved sessions spawned untouched.
+	KeepSubagentImports bool
+	// CodexHome holds Codex's session rollouts; empty skips the search for
+	// imported subagent sessions.
+	CodexHome string
 	// ArchiveSource archives moved threads in the source after the target
 	// commit.
 	ArchiveSource bool
@@ -70,9 +76,12 @@ type Plan struct {
 	sourceSessions int
 	archiveSource  bool
 	duplicates     []string
-	sessions       []sessionCopy
-	attachments    []attachmentFile
-	counts         map[string]int64
+	// subagentImports are target imports of sessions that moved sessions
+	// spawned, directly or through other subagents (ADR-002).
+	subagentImports []string
+	sessions        []sessionCopy
+	attachments     []attachmentFile
+	counts          map[string]int64
 }
 
 // ProjectPlan is the part of a plan for one source project.
@@ -95,6 +104,7 @@ type ProjectPlan struct {
 	Attachments     int
 	AttachmentBytes int64
 	Duplicates      int
+	SubagentImports int
 	ScheduledTasks  int
 	Blockers        []string
 	Warnings        []string
@@ -119,6 +129,12 @@ func (p *Plan) sourcePending() bool {
 	return p.archiveSource && (len(p.archive) > 0 || p.sourceTasks > 0 || p.sourceSessions > 0)
 }
 
+// targetPending reports whether the target still has imports of moved
+// sessions to soft-delete, even when every thread is already there.
+func (p *Plan) targetPending() bool {
+	return len(p.duplicates) > 0 || len(p.subagentImports) > 0
+}
+
 // ThreadCount returns the number of threads the move copies.
 func (p *Plan) ThreadCount() int {
 	return len(p.threads)
@@ -129,6 +145,7 @@ type Result struct {
 	BackupDir         string
 	Rows              map[string]int64
 	Duplicates        int
+	SubagentImports   int
 	AttachmentsCopied int
 	Archived          int
 	TasksDisabled     int
@@ -163,8 +180,9 @@ func Analyze(ctx context.Context, opts Options) (*Plan, error) {
 }
 
 // Run plans the move and, when nothing blocks it, backs up the target, copies
-// the threads in one target transaction, copies attachments and finally
-// archives the moved threads in the source.
+// the threads and soft-deletes imports of their sessions in one target
+// transaction, copies attachments and finally archives the moved threads in
+// the source.
 func Run(ctx context.Context, opts Options) (*Plan, *Result, error) {
 	plan, err := Analyze(ctx, opts)
 	if err != nil {
@@ -173,13 +191,13 @@ func Run(ctx context.Context, opts Options) (*Plan, *Result, error) {
 	if plan.Blocked() {
 		return plan, nil, ErrBlocked
 	}
-	if len(plan.threads) == 0 && !plan.sourcePending() {
+	if len(plan.threads) == 0 && !plan.sourcePending() && !plan.targetPending() {
 		return plan, &Result{}, nil
 	}
 
 	now := opts.now()
 	result := &Result{Rows: map[string]int64{}}
-	if len(plan.threads) > 0 {
+	if len(plan.threads) > 0 || plan.targetPending() {
 		locked, err := moveTarget(ctx, opts, plan, now, result)
 		if locked != nil {
 			plan = locked

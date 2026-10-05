@@ -50,6 +50,7 @@ func (p *Plan) Write(w io.Writer) error {
 		fmt.Fprintf(&b, "  events   %d\n", pp.Events)
 		fmt.Fprintf(&b, "  attachments %d (%s)\n", pp.Attachments, byteSize(pp.AttachmentBytes))
 		fmt.Fprintf(&b, "  duplicates to soft-delete %d\n", pp.Duplicates)
+		fmt.Fprintf(&b, "  subagent imports to soft-delete %d\n", pp.SubagentImports)
 		if pp.ScheduledTasks > 0 {
 			fmt.Fprintf(&b, "  scheduled tasks %d\n", pp.ScheduledTasks)
 		}
@@ -71,12 +72,17 @@ func (p *Plan) Write(w io.Writer) error {
 	switch {
 	case p.Blocked():
 		fmt.Fprintln(&b, "result: blocked")
-	case len(p.Projects) == 0 || len(p.threads) == 0 && !p.sourcePending():
+	case len(p.Projects) == 0 || len(p.threads) == 0 && !p.sourcePending() && !p.targetPending():
 		fmt.Fprintln(&b, "result: nothing to move")
+	case len(p.threads) == 0 && !p.sourcePending():
+		fmt.Fprintf(&b, "result: ready to finish target cleanup of already moved threads "+
+			"(%d duplicate(s) and %d subagent import(s) to soft-delete)\n",
+			len(p.duplicates), len(p.subagentImports))
 	case len(p.threads) == 0:
-		fmt.Fprintf(&b, "result: ready to finish source cleanup of already moved threads "+
-			"(%d to archive, %d scheduled task(s) to disable, %d session binding(s) to detach)\n",
-			len(p.archive), p.sourceTasks, p.sourceSessions)
+		fmt.Fprintf(&b, "result: ready to finish cleanup of already moved threads "+
+			"(%d duplicate(s) and %d subagent import(s) to soft-delete; "+
+			"%d to archive, %d scheduled task(s) to disable, %d session binding(s) to detach)\n",
+			len(p.duplicates), len(p.subagentImports), len(p.archive), p.sourceTasks, p.sourceSessions)
 	default:
 		fmt.Fprintf(&b, "result: ready to move %d thread(s) from %d project(s)\n", len(p.threads), len(p.Projects))
 	}
@@ -107,6 +113,7 @@ func (r *Result) Write(w io.Writer) error {
 	}
 	fmt.Fprintf(&b, "attachments copied %d\n", r.AttachmentsCopied)
 	fmt.Fprintf(&b, "duplicates soft-deleted %d\n", r.Duplicates)
+	fmt.Fprintf(&b, "subagent imports soft-deleted %d\n", r.SubagentImports)
 	if r.SourceError != nil {
 		fmt.Fprintf(&b, "source NOT finished: %v\n", r.SourceError)
 		fmt.Fprintln(&b, "  the target move is committed; archive the moved threads in the source server by hand")
