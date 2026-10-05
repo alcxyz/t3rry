@@ -167,8 +167,11 @@ var importActivityChecks = []struct {
 }{
 	{`SELECT count(*) FROM orchestration_v2_projection_runs WHERE thread_id = ? AND status IN ` + sqlList(activeRunStatuses),
 		"thread %s has %d run(s) that are not finished"},
-	{`SELECT count(*) FROM orchestration_v2_projection_provider_threads WHERE thread_id = ?
-		AND (status = 'active' OR (json_valid(payload_json) AND json_array_length(payload_json, '$.pendingBackgroundTasks') > 0))`,
+	// Provider threads belong to a thread directly or through an owning node.
+	{`SELECT count(*) FROM orchestration_v2_projection_provider_threads p
+		LEFT JOIN orchestration_v2_projection_nodes n ON n.node_id = p.owner_node_id
+		WHERE (p.thread_id = ?1 OR n.thread_id = ?1)
+			AND (p.status = 'active' OR (json_valid(p.payload_json) AND json_array_length(p.payload_json, '$.pendingBackgroundTasks') > 0))`,
 		"thread %s has %d provider thread(s) that are active or have background tasks"},
 	{`SELECT count(*) FROM orchestration_v2_projection_runtime_requests WHERE thread_id = ? AND status = 'pending'`,
 		"thread %s has %d pending approval or input request(s)"},
@@ -233,7 +236,8 @@ func DeleteImports(ctx context.Context, opts ImportOptions) (*ImportPlan, *Impor
 		return plan, result, err
 	}
 	if locked.Blocked() {
-		return locked, nil, ErrBlocked
+		// The backup was taken; report it alongside the blockers.
+		return locked, result, ErrBlocked
 	}
 	commandID, err := newCommandID(deleteCommandPrefix)
 	if err != nil {

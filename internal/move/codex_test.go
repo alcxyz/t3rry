@@ -122,8 +122,29 @@ func TestKeepSubagentImports(t *testing.T) {
 	if plan.Projects[0].SubagentImports != 0 || result.SubagentImports != 0 || result.Duplicates != 1 {
 		t.Fatalf("plan %+v, result %+v", plan.Projects[0], result)
 	}
-	if !strings.Contains(strings.Join(plan.Projects[0].Warnings, "\n"), "kept because of --keep-subagent-imports") {
-		t.Fatalf("warnings: %v", plan.Projects[0].Warnings)
+	if got := f.dst.count("SELECT count(*) FROM orchestration_v2_projection_threads WHERE thread_id = ? AND deleted_at IS NULL", "import:codex:"+codexChild); got != 1 {
+		t.Fatalf("subagent import was deleted despite --keep-subagent-imports")
+	}
+	if !strings.Contains(strings.Join(plan.Warnings, "\n"), "kept because of --keep-subagent-imports") {
+		t.Fatalf("warnings: %v", plan.Warnings)
+	}
+}
+
+func TestChainThroughMissingRolloutWarns(t *testing.T) {
+	f := newFixture(t)
+	home := t.TempDir()
+	// The grandchild's parent has no rollout, so its root is unknown.
+	writeRollout(t, home, "sessions", codexGrandchild, spawnedBy(codexChild))
+	f.dst.thread(threadSpec{id: "import:codex:" + codexGrandchild, projectID: "p-dst", origin: "v1_import"})
+	f.dst.syncCursor()
+	opts := f.options()
+	opts.CodexHome = home
+	plan := analyzeOK(t, opts)
+	if plan.Projects[0].SubagentImports != 0 {
+		t.Fatalf("subagent imports = %d", plan.Projects[0].SubagentImports)
+	}
+	if !strings.Contains(strings.Join(plan.Warnings, "\n"), "1 imported Codex subagent thread(s) in the target descend from a session without a rollout") {
+		t.Fatalf("warnings: %v", plan.Warnings)
 	}
 }
 
@@ -182,28 +203,100 @@ func TestMissingCodexHomeWarns(t *testing.T) {
 	}
 }
 
-func TestReadCodexParent(t *testing.T) {
+func TestCodexRollouts(t *testing.T) {
 	home := t.TempDir()
-	writeRollout(t, home, "sessions", codexChild, spawnedBy("parent-1"))
-	writeRollout(t, home, "sessions", codexExec, `"exec"`)
-	writeRollout(t, home, "sessions", codexReview, `{"subagent":"review"}`)
-	parents, missing, err := codexParents(home, map[string]bool{codexChild: true, codexExec: true, codexReview: true, codexNoRollout: true})
-	if err != nil {
+	// sessions is a symlink, as in shared or dotfile-managed Codex homes.
+	real := t.TempDir()
+	writeRollout(t, real, "sessions", codexChild, spawnedBy("parent-1"))
+	writeRollout(t, real, "sessions", codexExec, `"exec"`)
+	writeRollout(t, real, "sessions", codexReview, `{"subagent":"review"}`)
+	if err := os.Symlink(filepath.Join(real, "sessions"), filepath.Join(home, "sessions")); err != nil {
 		t.Fatal(err)
 	}
-	if len(parents) != 1 || parents[codexChild] != "parent-1" {
-		t.Fatalf("parents = %v", parents)
-	}
-	if len(missing) != 1 || missing[0] != codexNoRollout {
-		t.Fatalf("missing = %v", missing)
+	// An empty rollout, as left by a crash before session_meta was written.
+	broken := filepath.Join(real, "sessions", "rollout-x-"+codexBusy+".jsonl")
+	if err := os.WriteFile(broken, nil, 0o644); err != nil {
+		t.Fatal(err)
 	}
 
-	// A rollout whose first line belongs to another session is an error.
-	path := filepath.Join(home, "sessions", "rollout-x-"+codexBusy+".jsonl")
-	if err := os.WriteFile(path, []byte(`{"type":"session_meta","payload":{"id":"other"}}`+"\n"), 0o644); err != nil {
+	r := indexCodexRollouts(home)
+	for id, want := range map[string]string{codexChild: "parent-1", codexExec: "", codexReview: "", codexBusy: "", codexNoRollout: ""} {
+		if got := r.parent(id); got != want {
+			t.Errorf("parent(%s) = %q, want %q", id, got, want)
+		}
+	}
+	if !r.has(codexChild) || r.has(codexNoRollout) {
+		t.Fatalf("index: child %v, missing %v", r.has(codexChild), r.has(codexNoRollout))
+	}
+	if len(r.problems) != 1 || !strings.Contains(r.problems[0], codexBusy) {
+		t.Fatalf("problems = %v", r.problems)
+	}
+}
+
+func TestSubagentChainThroughUnimportedSession(t *testing.T) {
+	f := newFixture(t)
+	home := t.TempDir()
+	// native-1 spawned child, which spawned grandchild; only the grandchild
+	// was imported into the target.
+	writeRollout(t, home, "sessions", codexChild, spawnedBy("native-1"))
+	writeRollout(t, home, "sessions", codexGrandchild, spawnedBy(codexChild))
+	f.dst.thread(threadSpec{id: "import:codex:" + codexGrandchild, projectID: "p-dst", origin: "v1_import"})
+	f.dst.syncCursor()
+	opts := f.options()
+	opts.CodexHome = home
+	if plan := analyzeOK(t, opts); plan.Projects[0].SubagentImports != 1 {
+		t.Fatalf("subagent imports = %d, want the grandchild", plan.Projects[0].SubagentImports)
+	}
+}
+
+func TestSessionImportedThroughTwoInstances(t *testing.T) {
+	f := newFixture(t)
+	home := t.TempDir()
+	writeRollout(t, home, "sessions", codexChild, spawnedBy("native-1"))
+	for _, id := range []string{"import:codex:" + codexChild, "import:codex-work:" + codexChild, "import:codex-other:" + codexChild} {
+		f.dst.thread(threadSpec{id: id, projectID: "p-dst", origin: "v1_import"})
+	}
+	f.dst.exec("UPDATE orchestration_v2_projection_threads SET provider_instance_id = 'codex-work' WHERE thread_id = ?", "import:codex-work:"+codexChild)
+	f.dst.exec("UPDATE orchestration_v2_projection_threads SET provider_instance_id = 'codex-other' WHERE thread_id = ?", "import:codex-other:"+codexChild)
+	f.dst.run("run-other", "import:codex-other:"+codexChild, 1, "completed")
+	f.dst.syncCursor()
+	opts := f.options()
+	opts.CodexHome = home
+	plan := analyzeOK(t, opts)
+	if got := strings.Join(plan.subagentImports, ","); got != "import:codex-work:"+codexChild+",import:codex:"+codexChild &&
+		got != "import:codex:"+codexChild+",import:codex-work:"+codexChild {
+		t.Fatalf("subagent imports = %s", got)
+	}
+	if !strings.Contains(strings.Join(plan.Projects[0].Warnings, "\n"), "import:codex-other:"+codexChild+" imports a subagent session of a moved thread but has its own activity") {
+		t.Fatalf("warnings: %v", plan.Projects[0].Warnings)
+	}
+}
+
+func TestBrokenRolloutWarnsInsteadOfFailing(t *testing.T) {
+	f, home := subagentFixture(t)
+	path := filepath.Join(home, "sessions", "2026", "01", "02", "rollout-2026-01-02T03-04-05-"+codexExec+".jsonl")
+	if err := os.WriteFile(path, []byte("{not json\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := codexParents(home, map[string]bool{codexBusy: true}); err == nil {
-		t.Fatal("mismatched session_meta was accepted")
+	opts := f.options()
+	opts.CodexHome = home
+	plan := analyzeOK(t, opts)
+	if plan.Blocked() || plan.Projects[0].SubagentImports != 2 {
+		t.Fatalf("blocked=%v subagent imports=%d", plan.Blocked(), plan.Projects[0].SubagentImports)
+	}
+	if !strings.Contains(strings.Join(plan.Warnings, "\n"), "1 problem(s) reading Codex rollouts") {
+		t.Fatalf("warnings: %v", plan.Warnings)
+	}
+}
+
+func TestOwnedSessionWithoutDriverInPayload(t *testing.T) {
+	f, home := subagentFixture(t)
+	// Older provider-thread rows lack nativeThreadRef.driver.
+	f.src.exec(`UPDATE orchestration_v2_projection_provider_threads
+		SET payload_json = json_remove(payload_json, '$.nativeThreadRef.driver') WHERE provider_thread_id = 'pt-a'`)
+	opts := f.options()
+	opts.CodexHome = home
+	if plan := analyzeOK(t, opts); plan.Projects[0].SubagentImports != 2 {
+		t.Fatalf("subagent imports = %d, want 2", plan.Projects[0].SubagentImports)
 	}
 }

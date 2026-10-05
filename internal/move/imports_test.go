@@ -53,10 +53,26 @@ func TestListImports(t *testing.T) {
 
 func TestDeleteImportsBlockers(t *testing.T) {
 	b := importsBase(t)
+	// import:codex:node owns an active provider thread only through a node.
+	b.thread(threadSpec{id: "import:codex:node", projectID: "p-1", origin: "v1_import"})
+	b.exec(`INSERT INTO orchestration_v2_projection_nodes (node_id, thread_id, root_node_id, kind, status, payload_json)
+		VALUES ('node-sub', 'import:codex:node', 'node-sub', 'subagent', 'completed', '{}')`)
+	b.exec(`INSERT INTO orchestration_v2_projection_provider_threads (provider_thread_id, owner_node_id, provider, status, updated_at, payload_json)
+		VALUES ('pt-node', 'node-sub', 'codex', 'active', ?, '{}')`, testStamp)
+	b.thread(threadSpec{id: "import:codex:asks", projectID: "p-1", origin: "v1_import"})
+	b.exec(`INSERT INTO orchestration_v2_projection_runtime_requests (runtime_request_id, thread_id, node_id, kind, status, created_at, payload_json)
+		VALUES ('req-1', 'import:codex:asks', 'node-x', 'approval', 'pending', ?, '{}')`, testStamp)
+	b.thread(threadSpec{id: "import:codex:effect", projectID: "p-1", origin: "v1_import"})
+	b.exec(`INSERT INTO orchestration_v2_effect_outbox (effect_id, command_id, thread_id, effect_type, payload_json, status, available_at, created_at, updated_at)
+		VALUES ('effect-1', 'command:x', 'import:codex:effect', 'provider-session.detach', '{}', 'pending', ?1, ?1, ?1)`, testStamp)
+	b.syncCursor()
 	for id, want := range map[string]string{
-		"thread-native":     "was not created by \"import recent sessions\"",
-		"import:codex:busy": "has 1 run(s) that are not finished",
-		"import:codex:none": "does not exist",
+		"thread-native":       "was not created by \"import recent sessions\"",
+		"import:codex:busy":   "has 1 run(s) that are not finished",
+		"import:codex:none":   "does not exist",
+		"import:codex:node":   "has 1 provider thread(s) that are active",
+		"import:codex:asks":   "has 1 pending approval or input request(s)",
+		"import:codex:effect": "has 1 queued server effect(s)",
 	} {
 		plan, result, err := DeleteImports(context.Background(), ImportOptions{Base: b.inst, Threads: []string{id}})
 		if !errors.Is(err, ErrBlocked) || result != nil {

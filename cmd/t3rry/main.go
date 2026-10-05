@@ -209,9 +209,6 @@ func runPlan(ctx context.Context, args []string, stdout, stderr io.Writer, write
 			err = werr
 		}
 	}
-	if errors.Is(err, move.ErrBlocked) {
-		return errSilent
-	}
 	if result != nil {
 		if _, werr := fmt.Fprintln(stdout); werr != nil && err == nil {
 			err = werr
@@ -219,6 +216,9 @@ func runPlan(ctx context.Context, args []string, stdout, stderr io.Writer, write
 		if werr := result.Write(stdout); werr != nil && err == nil {
 			err = werr
 		}
+	}
+	if errors.Is(err, move.ErrBlocked) {
+		return errSilent
 	}
 	if err != nil {
 		return err
@@ -343,9 +343,6 @@ func runDeleteImports(ctx context.Context, args []string, stdout, stderr io.Writ
 			err = werr
 		}
 	}
-	if errors.Is(err, move.ErrBlocked) {
-		return errSilent
-	}
 	if result != nil {
 		if _, werr := fmt.Fprintln(stdout); werr != nil && err == nil {
 			err = werr
@@ -353,6 +350,9 @@ func runDeleteImports(ctx context.Context, args []string, stdout, stderr io.Writ
 		if werr := result.Write(stdout); werr != nil && err == nil {
 			err = werr
 		}
+	}
+	if errors.Is(err, move.ErrBlocked) {
+		return errSilent
 	}
 	return err
 }
