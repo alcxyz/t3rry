@@ -92,7 +92,7 @@ func finishSource(ctx context.Context, opts Options, plan *Plan, now time.Time, 
 			}
 			marked++
 		}
-		n, err := detachSessions(ctx, conn, id, commandID, stamp)
+		n, err := detachSessions(ctx, conn, id, commandID, stamp, "Thread archived.")
 		if err != nil {
 			return fmt.Errorf("detach sessions of %s: %w", id, err)
 		}
@@ -128,9 +128,9 @@ func finishSource(ctx context.Context, opts Options, plan *Plan, now time.Time, 
 }
 
 // detachSessions mirrors the provider-session.detached events the server
-// emits when archiving a thread whose bound sessions are not stopped. The
-// server is offline, so there is no live session process to stop.
-func detachSessions(ctx context.Context, conn *sql.Conn, threadID, commandID, stamp string) (int, error) {
+// emits when archiving or deleting a thread whose bound sessions are not
+// stopped. The server is offline, so there is no live session process to stop.
+func detachSessions(ctx context.Context, conn *sql.Conn, threadID, commandID, stamp, reason string) (int, error) {
 	rows, err := conn.QueryContext(ctx, `
 		SELECT s.provider_session_id, s.driver, s.provider_instance_id
 		FROM main.orchestration_v2_projection_provider_session_bindings b
@@ -161,7 +161,7 @@ func detachSessions(ctx context.Context, conn *sql.Conn, threadID, commandID, st
 			ProviderSessionID string `json:"providerSessionId"`
 			DetachedAt        string `json:"detachedAt"`
 			Reason            string `json:"reason"`
-		}{s.id, stamp, "Thread archived."})
+		}{s.id, stamp, reason})
 		if err != nil {
 			return 0, err
 		}

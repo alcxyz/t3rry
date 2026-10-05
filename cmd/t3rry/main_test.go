@@ -21,6 +21,8 @@ func TestRunArguments(t *testing.T) {
 		{name: "plan needs both dirs", args: []string{"--from", "/x"}, code: 2},
 		{name: "move needs --yes", args: []string{"move", "--from", "/x", "--to", "/y"}, code: 2},
 		{name: "check needs base dir", args: []string{"check"}, code: 2},
+		{name: "delete-imports needs base dir", args: []string{"delete-imports"}, code: 2},
+		{name: "delete-imports --yes needs a thread", args: []string{"delete-imports", "--base-dir", "/x", "--yes"}, code: 2},
 		{name: "missing base dir", args: []string{"plan", "--from", "/nonexistent-t3rry", "--to", "/nonexistent-t3rry-2"}, code: 1},
 	}
 	for _, test := range tests {
