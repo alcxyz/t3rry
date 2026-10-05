@@ -372,3 +372,116 @@ func TestEventIDFormat(t *testing.T) {
 		t.Fatalf("encodeURIComponent = %s", got)
 	}
 }
+
+func TestRetryFinishesSourceCleanup(t *testing.T) {
+	f := newFixture(t)
+	opts := f.options()
+	opts.BackupDir = filepath.Join(t.TempDir(), "backup")
+	// Make the source cleanup fail after the target commit.
+	f.src.exec(`CREATE TRIGGER fail_cleanup BEFORE UPDATE ON scheduled_tasks
+		BEGIN SELECT RAISE(ABORT, 'injected failure'); END`)
+	_, result, err := Run(context.Background(), opts)
+	if err != nil || result.SourceError == nil {
+		t.Fatalf("first run: err=%v source error=%v, want a source error", err, result.SourceError)
+	}
+	if got := f.dst.count("SELECT count(*) FROM orchestration_v2_projection_threads WHERE thread_id IN ('thread-a', 'thread-b')"); got != 2 {
+		t.Fatalf("target holds %d moved threads, want 2", got)
+	}
+	if got := f.src.count("SELECT enabled FROM scheduled_tasks WHERE task_id = 'task-a'"); got != 1 {
+		t.Fatal("failed cleanup left partial source changes")
+	}
+
+	f.src.exec("DROP TRIGGER fail_cleanup")
+	retry := analyzeOK(t, f.options())
+	if retry.Blocked() || retry.ThreadCount() != 0 || !retry.sourcePending() {
+		t.Fatalf("retry plan: blocked=%v threads=%d pending=%v", retry.Blocked(), retry.ThreadCount(), retry.sourcePending())
+	}
+	opts.BackupDir = filepath.Join(t.TempDir(), "backup")
+	_, result, err = Run(context.Background(), opts)
+	if err != nil || result.SourceError != nil {
+		t.Fatalf("retry: err=%v source error=%v", err, result.SourceError)
+	}
+	if result.Archived != 2 || result.TasksDisabled != 1 {
+		t.Fatalf("retry archived %d and disabled %d task(s), want 2 and 1", result.Archived, result.TasksDisabled)
+	}
+	if got := f.src.count("SELECT enabled FROM scheduled_tasks WHERE task_id = 'task-a'"); got != 0 {
+		t.Fatal("source task still enabled after retry")
+	}
+	if got := f.src.count("SELECT count(*) FROM orchestration_v2_projection_threads WHERE thread_id IN ('thread-a', 'thread-b') AND archived_at IS NOT NULL"); got != 2 {
+		t.Fatalf("%d of 2 source threads archived after retry", got)
+	}
+	if got, want := f.src.count("SELECT last_sequence FROM orchestration_v2_projection_metadata"), f.src.count("SELECT MAX(sequence) FROM orchestration_events WHERE application_event_version = 2 AND aggregate_kind = 'thread'"); got != want {
+		t.Fatalf("source cursor = %d, newest thread event = %d", got, want)
+	}
+
+	// Nothing is left to do, and another run changes nothing.
+	before := f.src.count("SELECT count(*) FROM orchestration_events")
+	if final := analyzeOK(t, f.options()); final.sourcePending() {
+		t.Fatal("source cleanup still pending after it completed")
+	}
+	if _, _, err := Run(context.Background(), opts); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.src.count("SELECT count(*) FROM orchestration_events"); got != before {
+		t.Fatalf("idle rerun appended %d source events", got-before)
+	}
+}
+
+func TestReverseMoveIsRefused(t *testing.T) {
+	f := newFixture(t)
+	opts := f.options()
+	opts.BackupDir = filepath.Join(t.TempDir(), "backup")
+	if _, _, err := Run(context.Background(), opts); err != nil {
+		t.Fatal(err)
+	}
+
+	// Moving straight back finds the archived originals in the old source.
+	reverse := Options{From: f.dst.inst, To: f.src.inst, ArchiveSource: true, BackupDir: filepath.Join(t.TempDir(), "backup")}
+	srcEvents := f.src.count("SELECT count(*) FROM orchestration_events")
+	dstEvents := f.dst.count("SELECT count(*) FROM orchestration_events")
+	plan, _, err := Run(context.Background(), reverse)
+	if !errors.Is(err, ErrBlocked) {
+		t.Fatalf("reverse move error = %v, want ErrBlocked", err)
+	}
+	var out bytes.Buffer
+	if err := plan.Write(&out); err != nil {
+		t.Fatal(err)
+	}
+	want := "thread thread-a already exists in the target as an archived or deleted copy"
+	if !strings.Contains(out.String(), want) || !strings.Contains(out.String(), "unarchive it in the target's T3 Code") {
+		t.Fatalf("plan lacks %q:\n%s", want, out.String())
+	}
+	if f.src.count("SELECT count(*) FROM orchestration_events") != srcEvents || f.dst.count("SELECT count(*) FROM orchestration_events") != dstEvents {
+		t.Fatal("refused reverse move wrote events")
+	}
+	if got := f.dst.str("SELECT archived_at FROM orchestration_v2_projection_threads WHERE thread_id = 'thread-a'"); got != "" {
+		t.Fatal("refused reverse move archived the live copy")
+	}
+}
+
+func TestBackupDirInsideAttachmentsIsRejected(t *testing.T) {
+	f := newFixture(t)
+	link := filepath.Join(t.TempDir(), "attachments-link")
+	if err := os.Symlink(f.dst.inst.AttachmentsDir, link); err != nil {
+		t.Fatal(err)
+	}
+	before := f.dst.count("SELECT count(*) FROM orchestration_events")
+	for _, dir := range []string{
+		filepath.Join(f.dst.inst.AttachmentsDir, "backup"),
+		filepath.Join(link, "nested", "backup"),
+		f.dst.inst.UserData,
+	} {
+		opts := f.options()
+		opts.BackupDir = dir
+		_, _, err := Run(context.Background(), opts)
+		if err == nil || !strings.Contains(err.Error(), "attachments") {
+			t.Fatalf("backup dir %s: err = %v, want a rejection", dir, err)
+		}
+		if _, err := os.Stat(filepath.Join(f.dst.inst.AttachmentsDir, "backup")); !os.IsNotExist(err) {
+			t.Fatal("rejected backup dir was created")
+		}
+	}
+	if got := f.dst.count("SELECT count(*) FROM orchestration_events"); got != before {
+		t.Fatal("rejected backup still wrote the target")
+	}
+}

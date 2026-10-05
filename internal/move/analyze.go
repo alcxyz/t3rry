@@ -3,6 +3,7 @@ package move
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"path/filepath"
 	"sort"
@@ -158,6 +159,7 @@ func analyze(ctx context.Context, conn *sql.Conn, opts Options, plan *Plan) erro
 		planAttachments,
 		planDuplicates,
 		planScheduledTasks,
+		planSourceCleanup,
 		warnLegacyAndWorktrees,
 	}
 	for _, step := range steps {
@@ -484,7 +486,7 @@ func excludeAlreadyMoved(ctx context.Context, conn *sql.Conn, opts Options, plan
 	drop := map[string]bool{}
 	for _, id := range present {
 		pp := byProject[threads[id].projectID]
-		var sameOrigin, diverged bool
+		var sameOrigin, diverged, targetClosed bool
 		err := conn.QueryRowContext(ctx, `
 			SELECT
 				EXISTS (SELECT 1 FROM src.orchestration_events s
@@ -494,26 +496,31 @@ func excludeAlreadyMoved(ctx context.Context, conn *sql.Conn, opts Options, plan
 				EXISTS (SELECT 1 FROM src.orchestration_events s
 					WHERE s.application_event_version = 2 AND s.aggregate_kind = 'thread' AND s.stream_id = ?1
 						AND (s.command_id IS NULL OR s.command_id NOT LIKE ?2)
-						AND NOT EXISTS (SELECT 1 FROM main.orchestration_events e WHERE e.event_id = s.event_id))`,
-			id, commandPrefix+"%").Scan(&sameOrigin, &diverged)
+						AND NOT EXISTS (SELECT 1 FROM main.orchestration_events e WHERE e.event_id = s.event_id)),
+				COALESCE((SELECT archived_at IS NOT NULL OR deleted_at IS NOT NULL
+					FROM main.orchestration_v2_projection_threads WHERE thread_id = ?1), 0)`,
+			id, commandPrefix+"%").Scan(&sameOrigin, &diverged, &targetClosed)
 		if err != nil {
 			return err
 		}
+		t := threads[id]
 		switch {
 		case !sameOrigin:
 			pp.Blockers = append(pp.Blockers, fmt.Sprintf("thread %s already exists in the target", id))
 		case diverged:
 			pp.Blockers = append(pp.Blockers, fmt.Sprintf(
 				"thread %s was moved before but has changed in the source since", id))
+		case targetClosed && !t.archived && !t.deleted:
+			// The target copy is archived or deleted while the source copy is
+			// open: most likely the original of an earlier move in the other
+			// direction. Skipping it would leave the thread closed on both.
+			pp.Blockers = append(pp.Blockers, fmt.Sprintf(
+				"thread %s already exists in the target as an archived or deleted copy, probably the original of an earlier move; "+
+					"unarchive it in the target's T3 Code and archive this copy instead of moving it back", id))
 		default:
 			drop[id] = true
 			pp.AlreadyMoved++
 			pp.Threads--
-			t := threads[id]
-			if opts.ArchiveSource && !t.deleted && !t.archived {
-				plan.archive = append(plan.archive, id)
-				pp.Archive++
-			}
 		}
 	}
 	for _, id := range plan.threads {
@@ -521,9 +528,12 @@ func excludeAlreadyMoved(ctx context.Context, conn *sql.Conn, opts Options, plan
 			if _, err := conn.ExecContext(ctx, "DELETE FROM temp.t3rry_moved WHERE thread_id = ?", id); err != nil {
 				return err
 			}
-			continue
+		} else {
+			remaining = append(remaining, id)
 		}
-		remaining = append(remaining, id)
+		// Every selected thread that is or will be in the target gets its
+		// source cleanup, so a retry after a failed cleanup finishes it.
+		plan.selected = append(plan.selected, id)
 		t := threads[id]
 		if opts.ArchiveSource && !t.deleted && !t.archived {
 			plan.archive = append(plan.archive, id)
@@ -533,6 +543,48 @@ func excludeAlreadyMoved(ctx context.Context, conn *sql.Conn, opts Options, plan
 	plan.threads = remaining
 	sort.Strings(plan.archive)
 	return nil
+}
+
+// planSourceCleanup counts the scheduled tasks and live session bindings the
+// source still holds for selected threads, including threads an earlier run
+// already copied. Without archiving, enabled tasks would run on both servers.
+func planSourceCleanup(ctx context.Context, conn *sql.Conn, opts Options, plan *Plan, threads map[string]*sourceThread) error {
+	if len(plan.selected) == 0 {
+		return nil
+	}
+	ids, err := json.Marshal(plan.selected)
+	if err != nil {
+		return err
+	}
+	rows, err := conn.QueryContext(ctx, `
+		SELECT task_id, thread_id FROM src.scheduled_tasks
+		WHERE enabled <> 0 AND thread_id IN (SELECT value FROM json_each(?))
+		ORDER BY task_id`, string(ids))
+	if err != nil {
+		return err
+	}
+	byProject := projectIndex(plan)
+	for rows.Next() {
+		var taskID, threadID string
+		if err := rows.Scan(&taskID, &threadID); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		plan.sourceTasks++
+		if !opts.ArchiveSource {
+			pp := byProject[threads[threadID].projectID]
+			pp.Blockers = append(pp.Blockers, fmt.Sprintf(
+				"scheduled task %s would run on both servers; it is disabled in the source only when the source is archived", taskID))
+		}
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	return conn.QueryRowContext(ctx, `
+		SELECT count(*) FROM src.orchestration_v2_projection_provider_session_bindings b
+		JOIN src.orchestration_v2_projection_provider_sessions s ON s.provider_session_id = b.provider_session_id
+		WHERE b.thread_id IN (SELECT value FROM json_each(?)) AND s.status NOT IN ('stopped', 'error')`,
+		string(ids)).Scan(&plan.sourceSessions)
 }
 
 // checkActiveWork blocks threads the source server is still driving.
@@ -816,7 +868,7 @@ func planDuplicates(ctx context.Context, conn *sql.Conn, opts Options, plan *Pla
 // about project-level tasks, which stay in the source.
 func planScheduledTasks(ctx context.Context, conn *sql.Conn, opts Options, plan *Plan, _ map[string]*sourceThread) error {
 	rows, err := conn.QueryContext(ctx, `
-		SELECT s.task_id, m.source_project_id, s.enabled,
+		SELECT s.task_id, m.source_project_id,
 			EXISTS (SELECT 1 FROM main.scheduled_tasks t WHERE t.task_id = s.task_id)
 		FROM src.scheduled_tasks s
 		JOIN temp.t3rry_moved m ON m.thread_id = s.thread_id
@@ -827,8 +879,8 @@ func planScheduledTasks(ctx context.Context, conn *sql.Conn, opts Options, plan 
 	byProject := projectIndex(plan)
 	for rows.Next() {
 		var id, projectID string
-		var enabled, exists bool
-		if err := rows.Scan(&id, &projectID, &enabled, &exists); err != nil {
+		var exists bool
+		if err := rows.Scan(&id, &projectID, &exists); err != nil {
 			_ = rows.Close()
 			return err
 		}
@@ -837,10 +889,6 @@ func planScheduledTasks(ctx context.Context, conn *sql.Conn, opts Options, plan 
 		plan.counts[tableTasks]++
 		if exists {
 			pp.Blockers = append(pp.Blockers, fmt.Sprintf("scheduled task %s already exists in the target", id))
-		}
-		if enabled && !opts.ArchiveSource {
-			pp.Blockers = append(pp.Blockers, fmt.Sprintf(
-				"scheduled task %s would run on both servers; it is disabled in the source only when the source is archived", id))
 		}
 	}
 	if err := rows.Close(); err != nil {

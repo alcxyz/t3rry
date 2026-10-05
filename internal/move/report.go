@@ -71,10 +71,12 @@ func (p *Plan) Write(w io.Writer) error {
 	switch {
 	case p.Blocked():
 		fmt.Fprintln(&b, "result: blocked")
-	case len(p.Projects) == 0 || len(p.threads) == 0 && len(p.archive) == 0:
+	case len(p.Projects) == 0 || len(p.threads) == 0 && !p.sourcePending():
 		fmt.Fprintln(&b, "result: nothing to move")
 	case len(p.threads) == 0:
-		fmt.Fprintf(&b, "result: ready to archive %d already moved thread(s) in the source\n", len(p.archive))
+		fmt.Fprintf(&b, "result: ready to finish source cleanup of already moved threads "+
+			"(%d to archive, %d scheduled task(s) to disable, %d session binding(s) to detach)\n",
+			len(p.archive), p.sourceTasks, p.sourceSessions)
 	default:
 		fmt.Fprintf(&b, "result: ready to move %d thread(s) from %d project(s)\n", len(p.threads), len(p.Projects))
 	}

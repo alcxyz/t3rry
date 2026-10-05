@@ -9,19 +9,22 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/alcxyz/t3rry/internal/instance"
 	"github.com/alcxyz/t3rry/internal/store"
 )
 
-// finishSource archives the moved threads in the source and disables their
-// scheduled tasks, in one source transaction after the target commit.
+// finishSource archives the selected threads in the source, detaches their
+// live sessions and disables their scheduled tasks, in one source transaction
+// after the target commit. It covers threads an earlier run already copied
+// and skips work already done, so a retry completes a failed cleanup.
 // Archiving mirrors the server's thread.archive command: a thread.archived
 // snapshot event plus the projection row update, and detaching sessions that
 // were not stopped.
 func finishSource(ctx context.Context, opts Options, plan *Plan, now time.Time, result *Result) error {
-	if !opts.ArchiveSource || len(plan.archive) == 0 && plan.counts[tableTasks] == 0 {
+	if !opts.ArchiveSource || len(plan.selected) == 0 {
 		return nil
 	}
 	if activity := opts.From.Activity(); activity.Running() {
@@ -55,38 +58,43 @@ func finishSource(ctx context.Context, opts Options, plan *Plan, now time.Time, 
 		return err
 	}
 	stamp := timestamp(now)
-	for _, id := range plan.archive {
+	archived, detached := 0, 0
+	for _, id := range plan.selected {
 		var open bool
 		err := conn.QueryRowContext(ctx,
 			"SELECT archived_at IS NULL AND deleted_at IS NULL FROM main."+tableThreads+" WHERE thread_id = ?", id).Scan(&open)
-		if errors.Is(err, sql.ErrNoRows) || err == nil && !open {
+		if errors.Is(err, sql.ErrNoRows) {
 			continue
 		}
 		if err != nil {
 			return err
 		}
-		if err := appendThreadSnapshot(ctx, conn, id, "thread.archived", commandID, stamp,
-			"'$.archivedAt', ?2, '$.titleRegeneration', NULL, '$.updatedAt', ?2"); err != nil {
-			return fmt.Errorf("archive %s: %w", id, err)
+		if open {
+			if err := appendThreadSnapshot(ctx, conn, id, "thread.archived", commandID, stamp,
+				"'$.archivedAt', ?2, '$.titleRegeneration', NULL, '$.updatedAt', ?2"); err != nil {
+				return fmt.Errorf("archive %s: %w", id, err)
+			}
+			archived++
 		}
-		if err := detachSessions(ctx, conn, id, commandID, stamp); err != nil {
-			return fmt.Errorf("archive %s: %w", id, err)
+		n, err := detachSessions(ctx, conn, id, commandID, stamp)
+		if err != nil {
+			return fmt.Errorf("detach sessions of %s: %w", id, err)
 		}
-		result.Archived++
+		detached += n
 	}
 
-	if len(plan.threads) > 0 {
-		ids, err := json.Marshal(plan.threads)
-		if err != nil {
-			return err
-		}
-		n, err := exec(ctx, conn, `
-			UPDATE main.scheduled_tasks SET enabled = 0, updated_at = ?1
-			WHERE enabled <> 0 AND thread_id IN (SELECT value FROM json_each(?2))`, stamp, string(ids))
-		if err != nil {
-			return fmt.Errorf("disable scheduled tasks: %w", err)
-		}
-		result.TasksDisabled = int(n)
+	ids, err := json.Marshal(plan.selected)
+	if err != nil {
+		return err
+	}
+	tasks, err := exec(ctx, conn, `
+		UPDATE main.scheduled_tasks SET enabled = 0, updated_at = ?1
+		WHERE enabled <> 0 AND thread_id IN (SELECT value FROM json_each(?2))`, stamp, string(ids))
+	if err != nil {
+		return fmt.Errorf("disable scheduled tasks: %w", err)
+	}
+	if archived == 0 && detached == 0 && tasks == 0 {
+		return nil
 	}
 	if err := advanceCursor(ctx, conn, stamp); err != nil {
 		return err
@@ -95,13 +103,15 @@ func finishSource(ctx context.Context, opts Options, plan *Plan, now time.Time, 
 		return err
 	}
 	committed = true
+	result.Archived = archived
+	result.TasksDisabled = int(tasks)
 	return nil
 }
 
 // detachSessions mirrors the provider-session.detached events the server
 // emits when archiving a thread whose bound sessions are not stopped. The
 // server is offline, so there is no live session process to stop.
-func detachSessions(ctx context.Context, conn *sql.Conn, threadID, commandID, stamp string) error {
+func detachSessions(ctx context.Context, conn *sql.Conn, threadID, commandID, stamp string) (int, error) {
 	rows, err := conn.QueryContext(ctx, `
 		SELECT s.provider_session_id, s.driver, s.provider_instance_id
 		FROM main.orchestration_v2_projection_provider_session_bindings b
@@ -109,7 +119,7 @@ func detachSessions(ctx context.Context, conn *sql.Conn, threadID, commandID, st
 		WHERE b.thread_id = ? AND s.status NOT IN ('stopped', 'error')
 		ORDER BY s.provider_session_id`, threadID)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	type session struct {
 		id               string
@@ -120,12 +130,12 @@ func detachSessions(ctx context.Context, conn *sql.Conn, threadID, commandID, st
 		var s session
 		if err := rows.Scan(&s.id, &s.driver, &s.instance); err != nil {
 			_ = rows.Close()
-			return err
+			return 0, err
 		}
 		sessions = append(sessions, s)
 	}
 	if err := rows.Close(); err != nil {
-		return err
+		return 0, err
 	}
 	for _, s := range sessions {
 		payload, err := json.Marshal(struct {
@@ -134,7 +144,7 @@ func detachSessions(ctx context.Context, conn *sql.Conn, threadID, commandID, st
 			Reason            string `json:"reason"`
 		}{s.id, stamp, "Thread archived."})
 		if err != nil {
-			return err
+			return 0, err
 		}
 		metadata := map[string]string{}
 		if s.driver.Valid {
@@ -145,28 +155,31 @@ func detachSessions(ctx context.Context, conn *sql.Conn, threadID, commandID, st
 		}
 		metadataJSON, err := json.Marshal(metadata)
 		if err != nil {
-			return err
+			return 0, err
 		}
 		eventID, err := newEventID(threadID, commandID)
 		if err != nil {
-			return err
+			return 0, err
 		}
 		if err := insertEvent(ctx, conn, eventID, threadID, "provider-session.detached", stamp, commandID,
 			string(payload), string(metadataJSON)); err != nil {
-			return err
+			return 0, err
 		}
 		if _, err := conn.ExecContext(ctx, `
 			DELETE FROM main.orchestration_v2_projection_provider_session_bindings
 			WHERE provider_session_id = ? AND thread_id = ?`, s.id, threadID); err != nil {
-			return err
+			return 0, err
 		}
 	}
-	return nil
+	return len(sessions), nil
 }
 
 // backupTarget writes a consistent copy of the target database with VACUUM
 // INTO and copies its attachments directory.
 func backupTarget(ctx context.Context, to instance.Instance, dir string) error {
+	if err := checkBackupDir(to.AttachmentsDir, dir); err != nil {
+		return err
+	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
@@ -185,6 +198,53 @@ func backupTarget(ctx context.Context, to instance.Instance, dir string) error {
 		return err
 	}
 	return copyTree(to.AttachmentsDir, filepath.Join(dir, "attachments"))
+}
+
+// checkBackupDir rejects backup directories whose attachments copy would land
+// inside, or on top of, the attachments directory being copied, following
+// symlinks in both paths.
+func checkBackupDir(attachments, dir string) error {
+	attachmentsReal := resolveExisting(attachments)
+	dirReal := resolveExisting(dir)
+	if within(dirReal, attachmentsReal) {
+		return fmt.Errorf("backup directory %s is inside the target's attachments directory %s", dir, attachments)
+	}
+	if within(attachmentsReal, filepath.Join(dirReal, "attachments")) {
+		return fmt.Errorf("backup directory %s would copy the target's attachments onto themselves", dir)
+	}
+	return nil
+}
+
+// resolveExisting makes path absolute and resolves symlinks in its longest
+// existing prefix.
+func resolveExisting(path string) string {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		abs = filepath.Clean(path)
+	}
+	var rest []string
+	current := abs
+	for {
+		real, err := filepath.EvalSymlinks(current)
+		if err == nil {
+			return filepath.Join(append([]string{real}, rest...)...)
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return abs
+		}
+		rest = append([]string{filepath.Base(current)}, rest...)
+		current = parent
+	}
+}
+
+// within reports whether path is root or below it.
+func within(path, root string) bool {
+	rel, err := filepath.Rel(root, path)
+	if err != nil {
+		return false
+	}
+	return rel == "." || rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
 func copyTree(src, dst string) error {

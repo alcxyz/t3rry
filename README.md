@@ -58,7 +58,12 @@ workspace root matches its physical path. See
   `VACUUM INTO`, and its attachments directory, to
   `<to>/userdata/t3rry-backups/<timestamp>/` (or `--backup-dir`).
 - **Repeatable.** Threads copied by an earlier run are recognised and
-  skipped. A thread that changed in the source since then blocks the move.
+  skipped, and a rerun finishes any source cleanup that failed before. A
+  thread that changed in the source since then blocks the move, and so does
+  moving a thread straight back onto its archived original: unarchive the
+  original in T3 Code instead.
+- **Backup location.** The backup directory may not lie inside the target's
+  attachments directory, even through a symlink.
 
 The source is changed only after the target commit succeeds, in its own
 transaction. Its moved threads are archived exactly as T3 Code's own archive

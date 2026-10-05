@@ -60,13 +60,19 @@ type Plan struct {
 	Blockers  []string
 	Warnings  []string
 
-	schema      *store.Schema
-	threads     []string
-	archive     []string
-	duplicates  []string
-	sessions    []sessionCopy
-	attachments []attachmentFile
-	counts      map[string]int64
+	schema  *store.Schema
+	threads []string
+	// selected holds every thread the move covers, including threads an
+	// earlier run already copied; source cleanup applies to all of them.
+	selected       []string
+	archive        []string
+	sourceTasks    int
+	sourceSessions int
+	archiveSource  bool
+	duplicates     []string
+	sessions       []sessionCopy
+	attachments    []attachmentFile
+	counts         map[string]int64
 }
 
 // ProjectPlan is the part of a plan for one source project.
@@ -105,6 +111,12 @@ func (p *Plan) Blocked() bool {
 		}
 	}
 	return false
+}
+
+// sourcePending reports whether the source still needs cleanup: archiving,
+// disabling scheduled tasks or detaching sessions of selected threads.
+func (p *Plan) sourcePending() bool {
+	return p.archiveSource && (len(p.archive) > 0 || p.sourceTasks > 0 || p.sourceSessions > 0)
 }
 
 // ThreadCount returns the number of threads the move copies.
@@ -159,30 +171,49 @@ func Run(ctx context.Context, opts Options) (*Plan, *Result, error) {
 	if plan.Blocked() {
 		return plan, nil, ErrBlocked
 	}
-	if len(plan.threads) == 0 && len(plan.archive) == 0 {
+	if len(plan.threads) == 0 && !plan.sourcePending() {
 		return plan, &Result{}, nil
 	}
 
 	now := opts.now()
 	result := &Result{Rows: map[string]int64{}}
+	if len(plan.threads) > 0 {
+		locked, err := moveTarget(ctx, opts, plan, now, result)
+		if locked != nil {
+			plan = locked
+		}
+		if err != nil {
+			return plan, result, err
+		}
+	}
+
+	result.SourceError = finishSource(ctx, opts, plan, now, result)
+	result.Verification = verifyTarget(ctx, opts, plan)
+	return plan, result, nil
+}
+
+// moveTarget backs up the target and copies the planned threads into it in
+// one transaction, re-planning under the write lock. It returns the locked
+// plan once it exists.
+func moveTarget(ctx context.Context, opts Options, plan *Plan, now time.Time, result *Result) (*Plan, error) {
 	result.BackupDir = opts.BackupDir
 	if result.BackupDir == "" {
 		result.BackupDir = filepath.Join(opts.To.UserData, "t3rry-backups", now.UTC().Format("20060102T150405Z"))
 	}
 	if err := backupTarget(ctx, opts.To, result.BackupDir); err != nil {
-		return plan, nil, fmt.Errorf("back up target: %w", err)
+		return nil, fmt.Errorf("back up target: %w", err)
 	}
 
 	if err := requireStopped(opts); err != nil {
-		return plan, result, err
+		return nil, err
 	}
 	conn, closeAll, err := openPair(ctx, opts, false)
 	if err != nil {
-		return plan, result, err
+		return nil, err
 	}
 	defer closeAll()
 	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
-		return plan, result, fmt.Errorf("lock target: %w", err)
+		return nil, fmt.Errorf("lock target: %w", err)
 	}
 	committed := false
 	defer func() {
@@ -194,44 +225,41 @@ func Run(ctx context.Context, opts Options) (*Plan, *Result, error) {
 	// Re-plan under the write lock so the copy matches the committed state.
 	locked := newPlan(opts)
 	if err := analyze(ctx, conn, opts, locked); err != nil {
-		return plan, result, err
+		return nil, err
 	}
 	if locked.Blocked() {
-		return locked, result, ErrBlocked
+		return locked, ErrBlocked
 	}
-	plan = locked
 
 	commandID, err := newCommandID()
 	if err != nil {
-		return plan, result, err
+		return locked, err
 	}
-	if err := applyTarget(ctx, conn, plan, now, commandID, result); err != nil {
-		return plan, result, fmt.Errorf("copy into target (rolled back): %w", err)
+	if err := applyTarget(ctx, conn, locked, now, commandID, result); err != nil {
+		return locked, fmt.Errorf("copy into target (rolled back): %w", err)
 	}
-	created, err := copyAttachments(plan.attachments)
+	created, err := copyAttachments(locked.attachments)
 	result.AttachmentsCopied = len(created)
 	if err != nil {
 		removeFiles(created)
-		return plan, result, fmt.Errorf("copy attachments (target rolled back): %w", err)
+		return locked, fmt.Errorf("copy attachments (target rolled back): %w", err)
 	}
 	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
 		removeFiles(created)
-		return plan, result, fmt.Errorf("commit target: %w", err)
+		return locked, fmt.Errorf("commit target: %w", err)
 	}
 	committed = true
-
-	result.SourceError = finishSource(ctx, opts, plan, now, result)
-	result.Verification = verifyTarget(ctx, opts, plan)
-	return plan, result, nil
+	return locked, nil
 }
 
 func newPlan(opts Options) *Plan {
 	return &Plan{
-		From:         opts.From,
-		To:           opts.To,
-		FromActivity: opts.From.Activity(),
-		ToActivity:   opts.To.Activity(),
-		counts:       map[string]int64{},
+		From:          opts.From,
+		To:            opts.To,
+		FromActivity:  opts.From.Activity(),
+		ToActivity:    opts.To.Activity(),
+		counts:        map[string]int64{},
+		archiveSource: opts.ArchiveSource,
 	}
 }
 
