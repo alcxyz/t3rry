@@ -879,7 +879,8 @@ func planSessions(ctx context.Context, conn *sql.Conn, _ Options, plan *Plan, _ 
 // Codex subagent sessions those sessions spawned.
 func planDuplicates(ctx context.Context, conn *sql.Conn, opts Options, plan *Plan, _ map[string]*sourceThread) error {
 	rows, err := conn.QueryContext(ctx, `
-		SELECT p.provider_instance_id, json_extract(p.payload_json, '$.nativeThreadRef.driver'),
+		SELECT p.provider_instance_id,
+			COALESCE(json_extract(p.payload_json, '$.nativeThreadRef.driver'), p.driver, p.provider),
 			json_extract(p.payload_json, '$.nativeThreadRef.nativeId'), m.source_project_id
 		FROM src.orchestration_v2_projection_provider_threads p
 		LEFT JOIN src.orchestration_v2_projection_nodes n ON n.node_id = p.owner_node_id
@@ -960,9 +961,11 @@ func planDuplicates(ctx context.Context, conn *sql.Conn, opts Options, plan *Pla
 
 // planSubagentImports finds target imports of Codex sessions that a moved
 // session spawned as a subagent, directly or through other subagents. Codex
-// records the parent only in the session_meta line of the child's rollout.
+// records the parent only in the session_meta line of the child's rollout, so
+// the chain is followed through rollouts whether or not the sessions in
+// between are imported.
 func planSubagentImports(ctx context.Context, conn *sql.Conn, opts Options, plan *Plan, codexOwned map[string]string, duplicates []string) error {
-	if len(codexOwned) == 0 || opts.CodexHome == "" {
+	if len(codexOwned) == 0 || opts.CodexHome == "" || opts.KeepSubagentImports {
 		return nil
 	}
 	var targets []string
@@ -988,8 +991,9 @@ func planSubagentImports(ctx context.Context, conn *sql.Conn, opts Options, plan
 	for _, id := range duplicates {
 		skip[id] = true
 	}
-	// threadOf maps a candidate's Codex session id to its target thread.
-	threadOf := map[string]string{}
+	// threadsOf maps a candidate's Codex session id to its target threads;
+	// imports through different provider instances share a session id.
+	threadsOf := map[string][]string{}
 	for rows.Next() {
 		var id, instanceID string
 		if err := rows.Scan(&id, &instanceID); err != nil {
@@ -1000,12 +1004,13 @@ func planSubagentImports(ctx context.Context, conn *sql.Conn, opts Options, plan
 		if skip[id] || instanceID == "" || !strings.HasPrefix(id, prefix) {
 			continue
 		}
-		threadOf[strings.TrimPrefix(id, prefix)] = id
+		nativeID := strings.TrimPrefix(id, prefix)
+		threadsOf[nativeID] = append(threadsOf[nativeID], id)
 	}
 	if err := rows.Close(); err != nil {
 		return err
 	}
-	if len(threadOf) == 0 {
+	if len(threadsOf) == 0 {
 		return nil
 	}
 	if _, err := os.Stat(opts.CodexHome); err != nil {
@@ -1014,61 +1019,56 @@ func planSubagentImports(ctx context.Context, conn *sql.Conn, opts Options, plan
 		return nil
 	}
 
-	ids := map[string]bool{}
-	for nativeID := range threadOf {
-		ids[nativeID] = true
+	rollouts := indexCodexRollouts(opts.CodexHome)
+	candidates := make([]string, 0, len(threadsOf))
+	for nativeID := range threadsOf {
+		candidates = append(candidates, nativeID)
 	}
-	parents, missing, err := codexParents(opts.CodexHome, ids)
-	if err != nil {
-		return err
-	}
-	if len(missing) > 0 {
-		plan.Warnings = append(plan.Warnings, fmt.Sprintf(
-			"%d imported Codex thread(s) in the target have no rollout under %s and were not checked", len(missing), opts.CodexHome))
-	}
-
-	// Resolve each candidate to the moved session at the root of its spawn
-	// chain, if any. Chains are short; the depth bound guards against cycles.
-	spawned := map[string]string{}
-	for nativeID := range threadOf {
-		current := nativeID
-		for depth := 0; depth <= len(parents); depth++ {
-			parent, ok := parents[current]
-			if !ok {
-				break
-			}
-			if projectID, owned := codexOwned[parent]; owned {
-				spawned[nativeID] = projectID
-				break
-			}
-			current = parent
-		}
-	}
-
+	sort.Strings(candidates)
+	missing := 0
 	byProject := projectIndex(plan)
-	found := make([]string, 0, len(spawned))
-	for nativeID := range spawned {
-		found = append(found, nativeID)
-	}
-	sort.Strings(found)
-	for _, nativeID := range found {
-		id := threadOf[nativeID]
-		pp := byProject[spawned[nativeID]]
-		keep, err := importHasActivity(ctx, conn, id)
-		if err != nil {
-			return err
+	for _, nativeID := range candidates {
+		if !rollouts.has(nativeID) {
+			missing++
+			continue
 		}
-		switch {
-		case keep:
-			pp.Warnings = append(pp.Warnings, fmt.Sprintf(
-				"target thread %s imports a subagent session of a moved thread but has its own activity; it is kept", id))
-		case opts.KeepSubagentImports:
-			pp.Warnings = append(pp.Warnings, fmt.Sprintf(
-				"target thread %s imports a subagent session of a moved thread; kept because of --keep-subagent-imports", id))
-		default:
+		// Follow the spawn chain to a moved session; the visited set guards
+		// against cycles in malformed rollouts.
+		projectID := ""
+		visited := map[string]bool{nativeID: true}
+		for current := rollouts.parent(nativeID); current != "" && !visited[current]; current = rollouts.parent(current) {
+			if owner, owned := codexOwned[current]; owned {
+				projectID = owner
+				break
+			}
+			visited[current] = true
+		}
+		if projectID == "" {
+			continue
+		}
+		pp := byProject[projectID]
+		for _, id := range threadsOf[nativeID] {
+			keep, err := importHasActivity(ctx, conn, id)
+			if err != nil {
+				return err
+			}
+			if keep {
+				pp.Warnings = append(pp.Warnings, fmt.Sprintf(
+					"target thread %s imports a subagent session of a moved thread but has its own activity; it is kept", id))
+				continue
+			}
 			plan.subagentImports = append(plan.subagentImports, id)
 			pp.SubagentImports++
 		}
+	}
+	if missing > 0 {
+		plan.Warnings = append(plan.Warnings, fmt.Sprintf(
+			"%d imported Codex thread(s) in the target have no rollout under %s and were not checked", missing, opts.CodexHome))
+	}
+	if len(rollouts.problems) > 0 {
+		plan.Warnings = append(plan.Warnings, fmt.Sprintf(
+			"%d problem(s) reading Codex rollouts under %s; the sessions concerned were not checked (first: %s)",
+			len(rollouts.problems), opts.CodexHome, rollouts.problems[0]))
 	}
 	return nil
 }

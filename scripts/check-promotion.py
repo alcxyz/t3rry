@@ -28,14 +28,15 @@ def check(event, current, base_version, tag_exists):
 
 
 def version_at(commit):
-    """Return VERSION at commit; a base without one has never released."""
-    shown = subprocess.run(["git", "show", f"{commit}:VERSION"], text=True, capture_output=True)
-    if shown.returncode == 0:
-        return shown.stdout.strip()
-    exists = subprocess.run(["git", "cat-file", "-e", f"{commit}^{{commit}}"]).returncode
-    if exists != 0:
+    """Return VERSION at commit; a base without the file has never released."""
+    if subprocess.run(["git", "cat-file", "-e", f"{commit}^{{commit}}"],
+                      capture_output=True).returncode != 0:
         raise ValueError("could not read the base commit")
-    return "0.0.0"
+    if subprocess.run(["git", "cat-file", "-e", f"{commit}:VERSION"],
+                      capture_output=True).returncode != 0:
+        return "0.0.0"
+    # Any other failure to read an existing VERSION surfaces git's error.
+    return subprocess.check_output(["git", "show", f"{commit}:VERSION"], text=True).strip()
 
 
 def main():
