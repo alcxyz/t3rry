@@ -10,11 +10,21 @@ import (
 // commandPrefix marks the command ids of events t3rry appends to a target.
 const commandPrefix = "server:t3rry-move:"
 
-// archiveCommandPrefix marks the events t3rry's source cleanup appends: the
-// thread.archived event that records a thread as the original of a move, and
-// session detaches. These events are never copied, so a source-archive event
-// in a database means that database was the source of a move of the thread.
+// archiveCommandPrefix marks the command ids of t3rry's source cleanup.
 const archiveCommandPrefix = "server:t3rry-archive:"
+
+// sourceArchiveMarker is the metadata_json key t3rry's source cleanup sets on
+// the thread.archived event that records a database as the home of a moved
+// thread's original. Copies strip the key, so the marker only ever describes
+// the database it was written in. The server ignores unknown metadata keys.
+const sourceArchiveMarker = "t3rrySourceArchive"
+
+// markerCondition is a SQL predicate on the events aliased alias that selects
+// source-archive markers.
+func markerCondition(alias string) string {
+	return alias + ".event_type = 'thread.archived' AND json_extract(" + alias +
+		".metadata_json, '$." + sourceArchiveMarker + "') = 1"
+}
 
 // ownCommandPattern matches the command ids of every event t3rry writes.
 const ownCommandPattern = "server:t3rry-%"

@@ -134,6 +134,7 @@ usage errors exit with status 2.
   base directory keep pointing there, and the source server's worktree
   cleanup may remove them; the plan warns about such threads.
 - Scheduled tasks bound to moved threads move with them and are disabled in
+  the source. Tasks of deleted threads arrive disabled and stay unchanged in
   the source. Project-level scheduled tasks stay in the source.
 - Threads whose legacy transcript was never opened in the source are blocked
   until it is. See [What is not copied](#what-is-not-copied).
@@ -159,9 +160,11 @@ scheduled tasks bound to it. It deliberately leaves these tables behind:
 | `checkpoint_diff_blobs` | A v1 checkpoint diff cache the server no longer reads at this schema. |
 | `auth_*`, `pull_request_files_viewed` | Per-server pairing, sessions and review state, not thread data. |
 
-Source-cleanup events (`thread.archived` and session detaches t3rry appends to
-the source) are not copied either. They mark the source as the home of the
-original, which lets t3rry refuse to move a thread back onto it.
+When t3rry cleans up a source, it marks each moved thread's original with a
+`thread.archived` event whose metadata carries a source-archive marker, even
+when the thread was already archived or deleted. Later moves copy that event
+like any other but strip the marker, so a marker only ever means "this server
+held the original", and t3rry refuses to move a thread back onto it.
 
 ## Installation
 

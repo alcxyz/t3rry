@@ -354,7 +354,8 @@ func TestIncludeDeleted(t *testing.T) {
 	opts.IncludeDeleted = true
 	plan := analyzeOK(t, opts)
 	pp := plan.Projects[0]
-	if pp.Threads != 3 || pp.DeletedIncluded != 1 || pp.Archive != 2 {
+	// Source cleanup archives the two open threads and marks the deleted one.
+	if pp.Threads != 3 || pp.DeletedIncluded != 1 || pp.Archive != 3 {
 		t.Fatalf("plan %+v", pp)
 	}
 }
@@ -617,9 +618,12 @@ func TestBackupAttachmentsDestinationIsResolved(t *testing.T) {
 	} {
 		opts := f.options()
 		opts.BackupDir = dir
-		_, _, err := Run(context.Background(), opts)
+		_, result, err := Run(context.Background(), opts)
 		if err == nil || !strings.Contains(err.Error(), want) {
 			t.Fatalf("backup dir %s: err = %v, want %q", dir, err, want)
+		}
+		if result != nil && result.BackupDir != "" {
+			t.Fatalf("failed backup is reported as %s", result.BackupDir)
 		}
 	}
 	if got := f.dst.count("SELECT count(*) FROM orchestration_events"); got != before {
@@ -702,5 +706,93 @@ func TestFailedTargetCopyReportsRollback(t *testing.T) {
 	}
 	if got := f.src.str("SELECT archived_at FROM orchestration_v2_projection_threads WHERE thread_id = 'thread-a'"); got != "" {
 		t.Fatal("failed copy archived the source")
+	}
+}
+
+func TestReopenedOriginalIsArchivedAgain(t *testing.T) {
+	f := newFixture(t)
+	opts := f.options()
+	opts.BackupDir = filepath.Join(t.TempDir(), "backup")
+	if _, _, err := Run(context.Background(), opts); err != nil {
+		t.Fatal(err)
+	}
+	// The user archives the B copy and reopens the original in A.
+	f.dst.exec(`UPDATE orchestration_v2_projection_threads SET archived_at = ?1,
+		payload_json = json_set(payload_json, '$.archivedAt', ?1) WHERE thread_id = 'thread-a'`, testStamp)
+	f.src.exec(`UPDATE orchestration_v2_projection_threads SET archived_at = NULL,
+		payload_json = json_set(payload_json, '$.archivedAt', NULL) WHERE thread_id = 'thread-a'`)
+	f.src.event("thread-a", "thread.unarchived", f.src.str("SELECT payload_json FROM orchestration_v2_projection_threads WHERE thread_id = 'thread-a'"))
+	f.src.syncCursor()
+
+	// A fresh target C.
+	c := newBase(t)
+	c.project("p-c", f.workspace)
+	c.syncCursor()
+	toC := Options{From: f.src.inst, To: c.inst, ArchiveSource: true, BackupDir: filepath.Join(t.TempDir(), "backup")}
+	plan, result, err := Run(context.Background(), toC)
+	if err != nil {
+		var out bytes.Buffer
+		_ = plan.Write(&out)
+		t.Fatalf("A->C: %v\n%s", err, out.String())
+	}
+	if result.SourceError != nil || result.Archived != 1 {
+		t.Fatalf("A->C archived %d thread(s), source error %v; want the reopened original archived", result.Archived, result.SourceError)
+	}
+	if got := f.src.str("SELECT archived_at FROM orchestration_v2_projection_threads WHERE thread_id = 'thread-a'"); got == "" {
+		t.Fatal("reopened original is still open in A")
+	}
+	if got := f.src.count("SELECT count(*) FROM orchestration_events WHERE stream_id = 'thread-a' AND " + markerCondition("orchestration_events")); got != 2 {
+		t.Fatalf("A holds %d markers for thread-a, want 2", got)
+	}
+	// C received A's earlier marker as an ordinary archive event.
+	if got := c.count("SELECT count(*) FROM orchestration_events WHERE stream_id = 'thread-a' AND event_type = 'thread.archived'"); got != 1 {
+		t.Fatalf("C holds %d archive events for thread-a, want 1", got)
+	}
+	if got := c.count("SELECT count(*) FROM orchestration_events WHERE stream_id = 'thread-a' AND " + markerCondition("orchestration_events")); got != 0 {
+		t.Fatal("the copied archive event still carries the marker")
+	}
+}
+
+func TestDeletedThreadMarkerAndTask(t *testing.T) {
+	f := newFixture(t)
+	f.src.exec(`INSERT INTO scheduled_tasks (task_id, title, prompt, enabled, schedule_json, project_id, thread_id,
+			workspace_strategy_json, model_selection_json, runtime_mode, interaction_mode, created_by, creation_source,
+			created_at, updated_at, last_run_status, run_count)
+		VALUES ('task-d', 'Weekly', 'go', 1, '{}', 'p-src', 'thread-d', '{}', '{}', 'full-access', 'default', 'user', 'web', ?, ?, 'never', 0)`,
+		testStamp, testStamp)
+	opts := f.options()
+	opts.IncludeDeleted = true
+	opts.BackupDir = filepath.Join(t.TempDir(), "backup")
+	if _, _, err := Run(context.Background(), opts); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.src.count("SELECT count(*) FROM orchestration_events WHERE stream_id = 'thread-d' AND " + markerCondition("orchestration_events")); got != 1 {
+		t.Fatalf("deleted original has %d markers, want 1", got)
+	}
+	if got := f.src.str("SELECT deleted_at || '|' || COALESCE(archived_at, '') FROM orchestration_v2_projection_threads WHERE thread_id = 'thread-d'"); got != testStamp+"|" {
+		t.Fatalf("marking changed the deleted thread: %s", got)
+	}
+	if got := f.dst.count("SELECT enabled FROM scheduled_tasks WHERE task_id = 'task-d'"); got != 0 {
+		t.Fatal("the deleted thread's task arrived enabled")
+	}
+	if got := f.src.count("SELECT enabled FROM scheduled_tasks WHERE task_id = 'task-d'"); got != 1 {
+		t.Fatal("the source task of the deleted thread was disabled")
+	}
+
+	reverse := Options{From: f.dst.inst, To: f.src.inst, IncludeDeleted: true, ArchiveSource: true,
+		BackupDir: filepath.Join(t.TempDir(), "backup")}
+	plan, _, err := Run(context.Background(), reverse)
+	if !errors.Is(err, ErrBlocked) {
+		t.Fatalf("reverse move error = %v, want ErrBlocked", err)
+	}
+	var out bytes.Buffer
+	if err := plan.Write(&out); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "thread thread-d was moved out of the target earlier") {
+		t.Fatalf("plan:\n%s", out.String())
+	}
+	if got := f.src.count("SELECT enabled FROM scheduled_tasks WHERE task_id = 'task-d'"); got != 1 {
+		t.Fatal("the task ended up disabled on both servers")
 	}
 }

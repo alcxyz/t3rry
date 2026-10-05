@@ -202,13 +202,15 @@ func Run(ctx context.Context, opts Options) (*Plan, *Result, error) {
 // one transaction, re-planning under the write lock. It returns the locked
 // plan once it exists.
 func moveTarget(ctx context.Context, opts Options, plan *Plan, now time.Time, result *Result) (*Plan, error) {
-	result.BackupDir = opts.BackupDir
-	if result.BackupDir == "" {
-		result.BackupDir = filepath.Join(opts.To.UserData, "t3rry-backups", now.UTC().Format("20060102T150405Z"))
+	backupDir := opts.BackupDir
+	if backupDir == "" {
+		backupDir = filepath.Join(opts.To.UserData, "t3rry-backups", now.UTC().Format("20060102T150405Z"))
 	}
-	if err := backupTarget(ctx, opts.To, result.BackupDir); err != nil {
+	if err := backupTarget(ctx, opts.To, backupDir); err != nil {
 		return nil, fmt.Errorf("back up target: %w", err)
 	}
+	// Report the backup only once it is complete.
+	result.BackupDir = backupDir
 
 	if err := requireStopped(opts); err != nil {
 		return nil, err

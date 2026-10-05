@@ -500,8 +500,8 @@ func excludeAlreadyMoved(ctx context.Context, conn *sql.Conn, _ Options, plan *P
 						AND NOT EXISTS (SELECT 1 FROM main.orchestration_events e WHERE e.event_id = s.event_id)),
 				EXISTS (SELECT 1 FROM main.orchestration_events e
 					WHERE e.application_event_version = 2 AND e.aggregate_kind = 'thread' AND e.stream_id = ?1
-						AND e.event_type = 'thread.archived' AND e.command_id LIKE ?3)`,
-			id, ownCommandPattern, archiveCommandPrefix+"%").Scan(&sameOrigin, &diverged, &original)
+						AND `+markerCondition("e")+`)`,
+			id, ownCommandPattern).Scan(&sameOrigin, &diverged, &original)
 		if err != nil {
 			return err
 		}
@@ -558,10 +558,13 @@ func planSourceCleanup(ctx context.Context, conn *sql.Conn, opts Options, plan *
 	if err != nil {
 		return err
 	}
+	// Tasks of deleted threads stay as they are in the source; the target
+	// receives them disabled.
 	rows, err := conn.QueryContext(ctx, `
-		SELECT task_id, thread_id FROM src.scheduled_tasks
-		WHERE enabled <> 0 AND thread_id IN (SELECT value FROM json_each(?))
-		ORDER BY task_id`, string(ids))
+		SELECT s.task_id, s.thread_id FROM src.scheduled_tasks s
+		JOIN src.`+tableThreads+` t ON t.thread_id = s.thread_id
+		WHERE s.enabled <> 0 AND t.deleted_at IS NULL AND s.thread_id IN (SELECT value FROM json_each(?))
+		ORDER BY s.task_id`, string(ids))
 	if err != nil {
 		return err
 	}
@@ -583,17 +586,19 @@ func planSourceCleanup(ctx context.Context, conn *sql.Conn, opts Options, plan *
 		return err
 	}
 
-	// Source cleanup marks every selected thread that is not deleted with a
-	// source-archive event, archiving it when it is still open. The marker
-	// lets a later move in the opposite direction recognise the original.
+	// Source cleanup works from each thread's current state: it archives
+	// every open thread, even one marked by an earlier move, and marks every
+	// thread without a marker, deleted ones included. The marker lets a
+	// later move in the opposite direction recognise the original.
 	if opts.ArchiveSource {
 		rows, err := conn.QueryContext(ctx, `
 			SELECT t.thread_id, t.project_id FROM src.orchestration_v2_projection_threads t
-			WHERE t.thread_id IN (SELECT value FROM json_each(?1)) AND t.deleted_at IS NULL
-				AND NOT EXISTS (SELECT 1 FROM src.orchestration_events e
-					WHERE e.application_event_version = 2 AND e.aggregate_kind = 'thread'
-						AND e.stream_id = t.thread_id AND e.event_type = 'thread.archived' AND e.command_id LIKE ?2)
-			ORDER BY t.thread_id`, string(ids), archiveCommandPrefix+"%")
+			WHERE t.thread_id IN (SELECT value FROM json_each(?1))
+				AND ((t.archived_at IS NULL AND t.deleted_at IS NULL)
+					OR NOT EXISTS (SELECT 1 FROM src.orchestration_events e
+						WHERE e.application_event_version = 2 AND e.aggregate_kind = 'thread'
+							AND e.stream_id = t.thread_id AND `+markerCondition("e")+`))
+			ORDER BY t.thread_id`, string(ids))
 		if err != nil {
 			return err
 		}
@@ -727,7 +732,6 @@ func checkCollisions(ctx context.Context, conn *sql.Conn, _ Options, plan *Plan,
 		SELECT count(*) FROM src.orchestration_events s
 		JOIN temp.t3rry_moved m ON m.thread_id = s.stream_id
 		WHERE s.application_event_version = 2 AND s.aggregate_kind = 'thread'
-			AND (s.command_id IS NULL OR s.command_id NOT LIKE '`+archiveCommandPrefix+`%')
 			AND EXISTS (SELECT 1 FROM main.orchestration_events e WHERE e.event_id = s.event_id)`).Scan(&count)
 	if err != nil {
 		return err
@@ -764,7 +768,6 @@ func countRows(ctx context.Context, conn *sql.Conn, _ Options, plan *Plan, _ map
 		SELECT m.source_project_id, count(*) FROM src.orchestration_events e
 		JOIN temp.t3rry_moved m ON m.thread_id = e.stream_id
 		WHERE e.application_event_version = 2 AND e.aggregate_kind = 'thread'
-			AND (e.command_id IS NULL OR e.command_id NOT LIKE '`+archiveCommandPrefix+`%')
 		GROUP BY m.source_project_id`)
 	if err != nil {
 		return err

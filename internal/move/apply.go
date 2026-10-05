@@ -18,19 +18,18 @@ func applyTarget(ctx context.Context, conn *sql.Conn, plan *Plan, now time.Time,
 
 	// Events first, in source order, so AUTOINCREMENT assigns new sequences
 	// in the same order. Thread snapshots carry the target project id.
-	// Source-cleanup events stay behind: they mark the source database as the
-	// original's home, which a move back must be able to recognise.
+	// Source-archive markers are copied as ordinary archive events: the
+	// marker describes only the database it was written in.
 	events := schema.Table(tableEvents)
 	cols, exprs := selectList(events, "e", map[string]string{
+		"metadata_json": "json_remove(e.metadata_json, '$." + sourceArchiveMarker + "')",
 		"payload_json": "CASE WHEN e.event_type IN " + sqlList(threadSnapshotEventTypes) +
 			" AND json_type(e.payload_json, '$.projectId') = 'text'" +
 			" THEN json_set(e.payload_json, '$.projectId', m.target_project_id) ELSE e.payload_json END",
 	}, "sequence")
 	n, err := exec(ctx, conn, "INSERT INTO main."+tableEvents+" ("+cols+") SELECT "+exprs+
 		" FROM src."+tableEvents+" e JOIN temp.t3rry_moved m ON m.thread_id = e.stream_id"+
-		" WHERE e.application_event_version = 2 AND e.aggregate_kind = 'thread'"+
-		" AND (e.command_id IS NULL OR e.command_id NOT LIKE '"+archiveCommandPrefix+"%')"+
-		" ORDER BY e.sequence")
+		" WHERE e.application_event_version = 2 AND e.aggregate_kind = 'thread' ORDER BY e.sequence")
 	if err != nil {
 		return fmt.Errorf("copy events: %w", err)
 	}
@@ -64,7 +63,12 @@ func applyTarget(ctx context.Context, conn *sql.Conn, plan *Plan, now time.Time,
 	}
 
 	tasks := schema.Table(tableTasks)
-	cols, exprs = selectList(tasks, "s", map[string]string{"project_id": "m.target_project_id"})
+	// Tasks of deleted threads arrive disabled; the source keeps its copy.
+	cols, exprs = selectList(tasks, "s", map[string]string{
+		"project_id": "m.target_project_id",
+		"enabled": "(SELECT CASE WHEN t.deleted_at IS NULL THEN s.enabled ELSE 0 END" +
+			" FROM src." + tableThreads + " t WHERE t.thread_id = s.thread_id)",
+	})
 	n, err = exec(ctx, conn, "INSERT INTO main."+tableTasks+" ("+cols+") SELECT "+exprs+
 		" FROM src."+tableTasks+" s JOIN temp.t3rry_moved m ON m.thread_id = s.thread_id")
 	if err != nil {
@@ -80,8 +84,8 @@ func applyTarget(ctx context.Context, conn *sql.Conn, plan *Plan, now time.Time,
 
 	stamp := timestamp(now)
 	for _, id := range plan.duplicates {
-		err := appendThreadSnapshot(ctx, conn, id, "thread.deleted", commandID, stamp,
-			"'$.deletedAt', COALESCE(json_extract(payload_json, '$.deletedAt'), ?2), '$.titleRegeneration', NULL, '$.updatedAt', ?2")
+		err := appendThreadSnapshot(ctx, conn, id, "thread.deleted", commandID, stamp, false,
+			"'$.deletedAt', COALESCE(json_extract(payload_json, '$.deletedAt'), ?2), '$.titleRegeneration', NULL, '$.updatedAt', ?2", stamp)
 		if err != nil {
 			return fmt.Errorf("soft-delete duplicate %s: %w", id, err)
 		}
@@ -119,14 +123,20 @@ func copySessions(ctx context.Context, conn *sql.Conn, plan *Plan, result *Resul
 
 // appendThreadSnapshot appends a thread snapshot event built from the thread's
 // projection row with the given json_set path/value pairs, and writes the same
-// snapshot back to the row, as the server's projector does. In the pairs, ?2
-// is the event timestamp. It works on the main database of conn.
-func appendThreadSnapshot(ctx context.Context, conn *sql.Conn, threadID, eventType, commandID, stamp, sets string) error {
+// snapshot back to the row, as the server's projector does. The pairs refer to
+// setArgs as ?2 onwards. marker adds the source-archive marker to the event
+// metadata. It works on the main database of conn.
+func appendThreadSnapshot(ctx context.Context, conn *sql.Conn, threadID, eventType, commandID, stamp string,
+	marker bool, sets string, setArgs ...any) error {
+	metadataExpr := "json_object('providerInstanceId', json_extract(payload_json, '$.providerInstanceId'))"
+	if marker {
+		metadataExpr = "json_object('providerInstanceId', json_extract(payload_json, '$.providerInstanceId'), '" +
+			sourceArchiveMarker + "', json('true'))"
+	}
 	var payload, metadata string
 	err := conn.QueryRowContext(ctx,
-		"SELECT json_set(payload_json, "+sets+"), json_object('providerInstanceId', json_extract(payload_json, '$.providerInstanceId'))"+
-			" FROM main."+tableThreads+" WHERE thread_id = ?1",
-		threadID, stamp).Scan(&payload, &metadata)
+		"SELECT json_set(payload_json, "+sets+"), "+metadataExpr+" FROM main."+tableThreads+" WHERE thread_id = ?1",
+		append([]any{threadID}, setArgs...)...).Scan(&payload, &metadata)
 	if err != nil {
 		return err
 	}

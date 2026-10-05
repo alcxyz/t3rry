@@ -65,8 +65,8 @@ func finishSource(ctx context.Context, opts Options, plan *Plan, now time.Time, 
 			SELECT archived_at IS NOT NULL, deleted_at IS NOT NULL,
 				EXISTS (SELECT 1 FROM main.orchestration_events e
 					WHERE e.application_event_version = 2 AND e.aggregate_kind = 'thread' AND e.stream_id = ?1
-						AND e.event_type = 'thread.archived' AND e.command_id LIKE ?2)
-			FROM main.`+tableThreads+` WHERE thread_id = ?1`, id, archiveCommandPrefix+"%").
+						AND `+markerCondition("e")+`)
+			FROM main.`+tableThreads+` WHERE thread_id = ?1`, id).
 			Scan(&archivedAlready, &deleted, &hasMarker)
 		if errors.Is(err, sql.ErrNoRows) {
 			continue
@@ -74,22 +74,23 @@ func finishSource(ctx context.Context, opts Options, plan *Plan, now time.Time, 
 		if err != nil {
 			return err
 		}
+		// Work from the current state: a marker from an earlier move only
+		// records where the thread came from, it never means cleanup is done.
 		switch {
-		case deleted || hasMarker:
-		case archivedAlready:
-			// Archived by the user before the move: record the marker
-			// without changing when it was archived.
-			if err := appendThreadSnapshot(ctx, conn, id, "thread.archived", commandID, stamp,
+		case !deleted && !archivedAlready:
+			if err := appendThreadSnapshot(ctx, conn, id, "thread.archived", commandID, stamp, true,
+				"'$.archivedAt', ?2, '$.titleRegeneration', NULL, '$.updatedAt', ?2", stamp); err != nil {
+				return fmt.Errorf("archive %s: %w", id, err)
+			}
+			archived++
+		case !hasMarker:
+			// Archived or deleted before the move: record the marker
+			// without changing either state.
+			if err := appendThreadSnapshot(ctx, conn, id, "thread.archived", commandID, stamp, true,
 				"'$.titleRegeneration', NULL"); err != nil {
 				return fmt.Errorf("mark %s: %w", id, err)
 			}
 			marked++
-		default:
-			if err := appendThreadSnapshot(ctx, conn, id, "thread.archived", commandID, stamp,
-				"'$.archivedAt', ?2, '$.titleRegeneration', NULL, '$.updatedAt', ?2"); err != nil {
-				return fmt.Errorf("archive %s: %w", id, err)
-			}
-			archived++
 		}
 		n, err := detachSessions(ctx, conn, id, commandID, stamp)
 		if err != nil {
@@ -102,9 +103,12 @@ func finishSource(ctx context.Context, opts Options, plan *Plan, now time.Time, 
 	if err != nil {
 		return err
 	}
+	// Tasks of deleted threads stay as they are; their target copies are
+	// disabled.
 	tasks, err := exec(ctx, conn, `
 		UPDATE main.scheduled_tasks SET enabled = 0, updated_at = ?1
-		WHERE enabled <> 0 AND thread_id IN (SELECT value FROM json_each(?2))`, stamp, string(ids))
+		WHERE enabled <> 0 AND thread_id IN (SELECT value FROM json_each(?2))
+			AND thread_id IN (SELECT thread_id FROM main.`+tableThreads+` WHERE deleted_at IS NULL)`, stamp, string(ids))
 	if err != nil {
 		return fmt.Errorf("disable scheduled tasks: %w", err)
 	}
