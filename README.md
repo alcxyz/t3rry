@@ -123,16 +123,34 @@ systemctl --user start t3code.service t3code-work.service
 | `--from`, `--to` | plan, move | Source and target base directories; `~` is expanded |
 | `--project <path>` | plan, move | Workspace path of a project to move; repeatable |
 | `--include-deleted` | plan, move | Also move deleted threads |
-| `--yes` | move | Perform the move |
+| `--yes` | move, delete-imports | Perform the move or deletion |
 | `--keep-duplicates` | move | Keep target threads imported from the same sessions |
 | `--keep-subagent-imports` | move | Keep target threads imported from subagent sessions of moved threads |
 | `--codex-home <dir>` | plan, move | Codex home with session rollouts; default `$CODEX_HOME` or `~/.codex` |
 | `--no-archive-source` | move | Leave moved threads unarchived in the source |
-| `--backup-dir <dir>` | move | Where to write the target backup |
-| `--base-dir <dir>` | check | Base directory to check |
+| `--backup-dir <dir>` | move, delete-imports | Where to write the backup |
+| `--base-dir <dir>` | check, delete-imports | Base directory to check or clean |
+| `--thread <id>` | delete-imports | Imported thread to soft-delete; repeatable |
 
 `plan` and `check` exit with status 1 when something blocks a move, and
 usage errors exit with status 2.
+
+### Removing leftover imports
+
+A move keeps imports it cannot prove belong to the moved threads, and imports
+with activity of their own: for example standalone `codex exec` sessions, or an
+imported subagent session someone typed into. T3 Code can delete them one by
+one in its UI. `delete-imports` does it offline for a stopped server. It lists
+a base directory's imports, then soft-deletes the ones you name, as T3 Code's
+delete command does, after the same backup as a move:
+
+```sh
+t3rry delete-imports --base-dir ~/.t3-work
+t3rry delete-imports --base-dir ~/.t3-work --thread import:codex:<id> --yes
+```
+
+It only touches threads that "import recent sessions" created, and refuses
+threads with unfinished work. The provider's own session files are untouched.
 
 ## Limitations
 

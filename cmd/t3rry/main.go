@@ -31,6 +31,7 @@ Usage:
                [--include-deleted] [--codex-home <dir>] [--keep-duplicates]
                [--keep-subagent-imports] [--no-archive-source] [--backup-dir <dir>]
   t3rry check  --base-dir <base-dir>
+  t3rry delete-imports --base-dir <base-dir> [--thread <id>]... [--yes] [--backup-dir <dir>]
   t3rry version
 
 Both servers must be stopped. plan is read-only and is the default command.
@@ -39,6 +40,10 @@ selected; --project accepts a source or target workspace path. A move also
 soft-deletes the target's imports of the moved sessions and of the Codex
 subagent sessions they spawned, read from --codex-home (default $CODEX_HOME
 or ~/.codex).
+
+delete-imports lists the threads "import recent sessions" created in a base
+directory, and soft-deletes the ones named with --thread when given --yes,
+for imports the move's own cleanup keeps. Its server must be stopped.
 `
 
 // exitError carries a process exit status.
@@ -86,6 +91,8 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		return runPlan(ctx, args, stdout, stderr, true)
 	case "check":
 		return runCheck(ctx, args, stdout, stderr)
+	case "delete-imports":
+		return runDeleteImports(ctx, args, stdout, stderr)
 	case "version":
 		_, err := fmt.Fprintf(stdout, "t3rry %s\nsupported T3 Code schemas: %s\n",
 			buildinfo.Resolve(version), joinInts(store.SupportedMigrations()))
@@ -278,6 +285,76 @@ func resolveCodexHome(flagValue string) (string, error) {
 		return "", err
 	}
 	return filepath.Abs(expanded)
+}
+
+func runDeleteImports(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+	fs := flag.NewFlagSet("delete-imports", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	fs.Usage = func() { _, _ = fmt.Fprint(stderr, usage) }
+	baseDir := fs.String("base-dir", "", "T3 Code base directory")
+	var threads stringList
+	fs.Var(&threads, "thread", "id of an imported thread to soft-delete (repeatable)")
+	yes := fs.Bool("yes", false, "perform the deletion")
+	backupDir := fs.String("backup-dir", "", "backup directory (default <base-dir>/userdata/t3rry-backups/<timestamp>)")
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return nil
+		}
+		return &exitError{code: 2, err: errSilent}
+	}
+	if fs.NArg() > 0 {
+		return usageError("unexpected argument %q", fs.Arg(0))
+	}
+	if *baseDir == "" {
+		return usageError("--base-dir is required")
+	}
+	if *yes && len(threads) == 0 {
+		return usageError("--yes needs at least one --thread")
+	}
+	base, err := instance.Resolve(*baseDir)
+	if err != nil {
+		return err
+	}
+	opts := move.ImportOptions{Base: base, Threads: threads}
+	if *backupDir != "" {
+		dir, err := instance.ExpandHome(*backupDir)
+		if err != nil {
+			return err
+		}
+		opts.BackupDir = dir
+	}
+
+	if !*yes {
+		plan, err := move.AnalyzeImports(ctx, opts)
+		if err != nil {
+			return err
+		}
+		if err := plan.Write(stdout); err != nil {
+			return err
+		}
+		if plan.Blocked() {
+			return errSilent
+		}
+		return nil
+	}
+	plan, result, err := move.DeleteImports(ctx, opts)
+	if plan != nil {
+		if werr := plan.Write(stdout); werr != nil && err == nil {
+			err = werr
+		}
+	}
+	if errors.Is(err, move.ErrBlocked) {
+		return errSilent
+	}
+	if result != nil {
+		if _, werr := fmt.Fprintln(stdout); werr != nil && err == nil {
+			err = werr
+		}
+		if werr := result.Write(stdout); werr != nil && err == nil {
+			err = werr
+		}
+	}
+	return err
 }
 
 func joinInts(values []int) string {
