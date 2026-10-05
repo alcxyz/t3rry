@@ -43,6 +43,10 @@ considered only threads copied in that run.
   backup, when nothing else remains, so a rerun completes an older move.
 - Narrower moves stay available: `--keep-duplicates` keeps same-session
   imports and `--keep-subagent-imports` keeps imported subagent sessions.
+- Imports the automatic rules keep can be removed with `delete-imports`,
+  which soft-deletes named import threads of a stopped server with the same
+  backup and event semantics. It refuses anything that is not an import, and
+  threads with unfinished work.
 
 ## Alternatives and consequences
 

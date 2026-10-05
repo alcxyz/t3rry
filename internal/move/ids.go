@@ -13,6 +13,9 @@ const commandPrefix = "server:t3rry-move:"
 // archiveCommandPrefix marks the command ids of t3rry's source cleanup.
 const archiveCommandPrefix = "server:t3rry-archive:"
 
+// deleteCommandPrefix marks the command ids of `t3rry delete-imports`.
+const deleteCommandPrefix = "server:t3rry-delete-imports:"
+
 // sourceArchiveMarker is the metadata_json key t3rry's source cleanup sets on
 // the thread.archived event that records a database as the home of a moved
 // thread's original. Copies strip the key, so the marker only ever describes
