@@ -55,6 +55,9 @@ func (p *Plan) Write(w io.Writer) error {
 			fmt.Fprintf(&b, "  scheduled tasks %d\n", pp.ScheduledTasks)
 		}
 		fmt.Fprintf(&b, "  archive in source %d\n", pp.Archive)
+		if pp.Mark > 0 {
+			fmt.Fprintf(&b, "  mark in source %d\n", pp.Mark)
+		}
 		writeList(&b, "  ", "blocked", pp.Blockers)
 		writeList(&b, "  ", "warning", pp.Warnings)
 	}
@@ -81,8 +84,8 @@ func (p *Plan) Write(w io.Writer) error {
 	case len(p.threads) == 0:
 		fmt.Fprintf(&b, "result: ready to finish cleanup of already moved threads "+
 			"(%d duplicate(s) and %d subagent import(s) to soft-delete; "+
-			"%d to archive, %d scheduled task(s) to disable, %d session binding(s) to detach)\n",
-			len(p.duplicates), len(p.subagentImports), len(p.archive), p.sourceTasks, p.sourceSessions)
+			"%d to archive, %d to mark, %d scheduled task(s) to disable, %d session binding(s) to detach)\n",
+			len(p.duplicates), len(p.subagentImports), len(p.archive)-p.marks, p.marks, p.sourceTasks, p.sourceSessions)
 	default:
 		fmt.Fprintf(&b, "result: ready to move %d thread(s) from %d project(s)\n", len(p.threads), len(p.Projects))
 	}
@@ -119,6 +122,9 @@ func (r *Result) Write(w io.Writer) error {
 		fmt.Fprintln(&b, "  the target move is committed; archive the moved threads in the source server by hand")
 	} else {
 		fmt.Fprintf(&b, "archived in source %d\n", r.Archived)
+		if r.Marked > 0 {
+			fmt.Fprintf(&b, "marked in source %d\n", r.Marked)
+		}
 		if r.TasksDisabled > 0 {
 			fmt.Fprintf(&b, "scheduled tasks disabled in source %d\n", r.TasksDisabled)
 		}

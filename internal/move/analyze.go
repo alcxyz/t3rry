@@ -618,7 +618,8 @@ func planSourceCleanup(ctx context.Context, conn *sql.Conn, opts Options, plan *
 	// later move in the opposite direction recognise the original.
 	if opts.ArchiveSource {
 		rows, err := conn.QueryContext(ctx, `
-			SELECT t.thread_id, t.project_id FROM src.orchestration_v2_projection_threads t
+			SELECT t.thread_id, t.project_id, t.archived_at IS NULL AND t.deleted_at IS NULL
+			FROM src.orchestration_v2_projection_threads t
 			WHERE t.thread_id IN (SELECT value FROM json_each(?1))
 				AND ((t.archived_at IS NULL AND t.deleted_at IS NULL)
 					OR NOT EXISTS (SELECT 1 FROM src.orchestration_events e
@@ -630,13 +631,23 @@ func planSourceCleanup(ctx context.Context, conn *sql.Conn, opts Options, plan *
 		}
 		for rows.Next() {
 			var id, projectID string
-			if err := rows.Scan(&id, &projectID); err != nil {
+			var open bool
+			if err := rows.Scan(&id, &projectID, &open); err != nil {
 				_ = rows.Close()
 				return err
 			}
+			// Open threads are archived; threads already archived or
+			// deleted only receive the marker.
 			plan.archive = append(plan.archive, id)
+			if !open {
+				plan.marks++
+			}
 			if pp := byProject[projectID]; pp != nil {
-				pp.Archive++
+				if open {
+					pp.Archive++
+				} else {
+					pp.Mark++
+				}
 			}
 		}
 		if err := rows.Close(); err != nil {
