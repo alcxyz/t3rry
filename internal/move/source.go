@@ -123,6 +123,7 @@ func finishSource(ctx context.Context, opts Options, plan *Plan, now time.Time, 
 	}
 	committed = true
 	result.Archived = archived
+	result.Marked = marked
 	result.TasksDisabled = int(tasks)
 	return nil
 }

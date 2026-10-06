@@ -70,8 +70,12 @@ type Plan struct {
 	threads []string
 	// selected holds every thread the move covers, including threads an
 	// earlier run already copied; source cleanup applies to all of them.
-	selected       []string
+	selected []string
+	// archive holds every selected thread the source cleanup touches; marks
+	// counts those among them that are already archived or deleted and only
+	// receive the source-archive marker.
 	archive        []string
+	marks          int
 	sourceTasks    int
 	sourceSessions int
 	archiveSource  bool
@@ -100,6 +104,9 @@ type ProjectPlan struct {
 	DeletedIncluded int
 	AlreadyMoved    int
 	Archive         int
+	// Mark counts threads already archived or deleted in the source, which
+	// only receive the source-archive marker.
+	Mark            int
 	Events          int64
 	Attachments     int
 	AttachmentBytes int64
@@ -148,6 +155,7 @@ type Result struct {
 	SubagentImports   int
 	AttachmentsCopied int
 	Archived          int
+	Marked            int
 	TasksDisabled     int
 	// RolledBack is set when the target copy failed and nothing was written.
 	RolledBack bool
