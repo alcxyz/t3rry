@@ -355,8 +355,25 @@ func TestIncludeDeleted(t *testing.T) {
 	plan := analyzeOK(t, opts)
 	pp := plan.Projects[0]
 	// Source cleanup archives the two open threads and marks the deleted one.
-	if pp.Threads != 3 || pp.DeletedIncluded != 1 || pp.Archive != 3 {
+	if pp.Threads != 3 || pp.DeletedIncluded != 1 || pp.Archive != 2 || pp.Mark != 1 {
 		t.Fatalf("plan %+v", pp)
+	}
+	var out bytes.Buffer
+	if err := plan.Write(&out); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "archive in source 2\n  mark in source 1\n") {
+		t.Fatalf("plan output:\n%s", out.String())
+	}
+
+	// The result reports the same split as the plan.
+	opts.BackupDir = filepath.Join(t.TempDir(), "backup")
+	_, result, err := Run(context.Background(), opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Archived != 2 || result.Marked != 1 {
+		t.Fatalf("archived %d, marked %d", result.Archived, result.Marked)
 	}
 }
 
