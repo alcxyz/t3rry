@@ -154,6 +154,9 @@ threads with unfinished work. The provider's own session files are untouched.
 
 ## Limitations
 
+- When hard links are unavailable, attachment copies apply the source file
+  permission bits before completing. The destination filesystem must support
+  applying those permissions; a permission-setting error stops the copy.
 - Same host only. Moving between hosts would also need path rewriting,
   provider transcripts and attachment grants; see ADR-001.
 - Both servers must run the same supported T3 Code schema. New T3 Code

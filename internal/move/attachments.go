@@ -233,6 +233,12 @@ func copyAttachments(files []attachmentFile) ([]string, error) {
 // copyNoClobber copies src to a temporary file next to dst and links it into
 // place, failing if dst already exists.
 func copyNoClobber(src, dst string) error {
+	return copyNoClobberWithLink(src, dst, os.Link)
+}
+
+// copyNoClobberWithLink accepts the link operation so the exclusive-copy
+// fallback can be exercised on filesystems that support hard links.
+func copyNoClobberWithLink(src, dst string, link func(string, string) error) error {
 	in, err := os.Open(src)
 	if err != nil {
 		return err
@@ -258,7 +264,7 @@ func copyNoClobber(src, dst string) error {
 	if info, err := in.Stat(); err == nil {
 		_ = os.Chmod(tmpName, info.Mode().Perm())
 	}
-	err = os.Link(tmpName, dst)
+	err = link(tmpName, dst)
 	if errors.Is(err, os.ErrExist) {
 		return fmt.Errorf("%s appeared in the target during the move", dst)
 	}
@@ -275,11 +281,20 @@ func copyExclusive(src, dst string) error {
 		return err
 	}
 	defer func() { _ = in.Close() }()
-	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	info, err := in.Stat()
+	if err != nil {
+		return err
+	}
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		return err
 	}
 	if _, err := io.Copy(out, in); err != nil {
+		_ = out.Close()
+		_ = os.Remove(dst)
+		return err
+	}
+	if err := out.Chmod(info.Mode().Perm()); err != nil {
 		_ = out.Close()
 		_ = os.Remove(dst)
 		return err
