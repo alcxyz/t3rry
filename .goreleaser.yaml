@@ -49,3 +49,40 @@ release:
     name: t3rry
   draft: false
   prerelease: auto
+
+homebrew_casks:
+  - name: t3rry
+    repository:
+      owner: alcxyz
+      name: homebrew-tap
+      token: "{{ .Env.TAP_GITHUB_TOKEN }}"
+    homepage: https://github.com/alcxyz/t3rry
+    description: Move T3 Code projects and threads between server instances
+    license: MIT
+    hooks:
+      post:
+        # The binaries are not signed or notarized.
+        install: |
+          if OS.mac?
+            system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/t3rry"]
+          end
+
+aurs:
+  - name: t3rry-bin
+    homepage: https://github.com/alcxyz/t3rry
+    description: Move T3 Code projects and threads between server instances
+    maintainers:
+      - alcxyz <alcxyz@users.noreply.github.com>
+    license: MIT
+    private_key: "{{ .Env.AUR_KEY }}"
+    # Only trust the pinned AUR host keys the release job writes to known_hosts.
+    git_ssh_command: "ssh -i {{ .KeyPath }} -o StrictHostKeyChecking=yes -F /dev/null"
+    git_url: ssh://aur@aur.archlinux.org/t3rry-bin.git
+    provides:
+      - t3rry
+    conflicts:
+      - t3rry
+    package: |-
+      install -Dm755 "./t3rry" "${pkgdir}/usr/bin/t3rry"
+      install -Dm644 "./LICENSE" "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+      install -Dm644 "./README.md" "${pkgdir}/usr/share/doc/t3rry/README.md"

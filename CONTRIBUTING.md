@@ -88,7 +88,9 @@ To cut a release:
 1. Bump `VERSION` on `dev` to a plain release version like `0.1.0`
 2. Open a same-repository pull request from `dev` to `main`
 3. Wait for the promotion policy, checks, release snapshot and Nix build
-4. Merge with a merge commit, not a squash; CI tags and publishes the release
+4. Merge with a merge commit, not a squash; CI tags and publishes the release,
+   the cask in the [Homebrew tap](https://github.com/alcxyz/homebrew-tap) and the
+   [AUR](https://aur.archlinux.org/packages/t3rry-bin) package (`t3rry-bin`)
 5. Bump `dev` to the next development version like `0.1.1-dev`
 
 ## License

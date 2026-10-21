@@ -197,6 +197,20 @@ held the original", and t3rry refuses to move a thread back onto it.
 
 ## Installation
 
+With Homebrew:
+
+```sh
+brew install alcxyz/tap/t3rry
+```
+
+From the AUR (Arch Linux):
+
+```sh
+yay -S t3rry-bin
+```
+
+With Go:
+
 ```sh
 go install github.com/alcxyz/t3rry/cmd/t3rry@latest
 ```
